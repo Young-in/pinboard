@@ -79,6 +79,35 @@ test('pin tool stores a pin; the pane lists it, deletes on a second press, and u
   }
 })
 
+test('filter tabs show counts and narrow the list', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: '| a |\n|---|\n| 1 |', title: '표 하나' })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'https://example.com/docs', title: '문서 링크' })
+  const [link, table] = world.pins()
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'pinboard',
+      surface,
+      component: 'Pane',
+      requestId: 'pins',
+      props: PANE_PROPS,
+    })
+    expect(await ui.find({ type: 'Text', text: /전체 2/ })).toBeDefined()
+    expect((await ui.find({ type: 'Button', key: 'tab:link' }))?.text).toContain('링크 1')
+
+    await ui.press({ key: 'tab:link' })
+    expect(await ui.find({ key: `sel:${link!.id}` })).toBeDefined()
+    expect(await ui.find({ key: `sel:${table!.id}` })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', key: 'tab:all' })).toBeDefined()
+
+    await ui.press({ key: 'tab:all' })
+    expect(await ui.find({ key: `sel:${table!.id}` })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
 test('unpin and list tools work by title and index', async ($, on) => {
   const world = engine(on)
   await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })

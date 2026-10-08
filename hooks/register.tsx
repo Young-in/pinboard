@@ -400,20 +400,46 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
     void update($, confirmDeleteId, () => null)
     void update($, selectedId, cur => (cur === id ? null : id))
   }
-  const cycleFilter = () => {
+  const setFilter = (next: PinboardFilter) => {
     void update($, selectedId, () => null)
-    void update($, filter, cur => FILTERS[(FILTERS.indexOf(cur ?? 'all') + 1) % FILTERS.length] ?? 'all')
+    void update($, filter, () => next)
   }
+  const cycleFilter = () => setFilter(FILTERS[(FILTERS.indexOf(f) + 1) % FILTERS.length] ?? 'all')
+  const counts: Record<PinboardFilter, number> = {
+    all: list.length,
+    table: list.filter(p => p.kind === 'table').length,
+    artifact: list.filter(p => p.kind === 'artifact').length,
+    link: list.filter(p => p.kind === 'link').length,
+    project: list.filter(p => p.cwd === cwd).length,
+  }
+  const rule = '─'.repeat(width)
 
   return (
     <Box flexDirection="column">
       <Box justifyContent="space-between">
         <Text bold>
-          Pins {shown.length}
-          {f === 'all' ? '' : `/${list.length}`}
+          Pins <Text dimColor>{list.length}</Text>
         </Text>
-        <Button key="filter" hotkey="f" plain dimColor label={`필터: ${FILTER_LABEL[f]}`} onPress={cycleFilter} />
+        <Button key="filter" hotkey="f" plain dimColor label="다음 필터" onPress={cycleFilter} />
       </Box>
+      <Box flexWrap="wrap" columnGap={2}>
+        {FILTERS.map(name =>
+          name === f ? (
+            <Text color="claude" bold underline>
+              {FILTER_LABEL[name]} {counts[name]}
+            </Text>
+          ) : (
+            <Button
+              key={`tab:${name}`}
+              plain
+              dimColor
+              label={`${FILTER_LABEL[name]} ${counts[name]}`}
+              onPress={() => setFilter(name)}
+            />
+          ),
+        )}
+      </Box>
+      <Text dimColor>{rule}</Text>
 
       {shown.length === 0 && (
         <Text dimColor wrap="wrap">

@@ -75,4 +75,9 @@ function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n)
 }
 
-export const KIND_LABEL: Record<PinboardKind, string> = { table: '표', artifact: '아티팩트', link: '링크', text: '메모' }
+export const KIND_LABEL: Record<PinboardKind, string> = {
+  table: '표',
+  artifact: '아티팩트',
+  link: '링크',
+  text: '메모',
+}
