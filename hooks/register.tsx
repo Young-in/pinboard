@@ -20,7 +20,6 @@ import {
   firstLineTitle,
   isKind,
   projectName,
-  relativeTime,
 } from './extract'
 import { fitWidth, KIND_LABEL, localStamp, shortAge, textWidth } from './format'
 
@@ -403,7 +402,6 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const shown = visible(list, f, cwd)
   const selected = shown.find(p => p.id === sel) ?? null
   const width = Math.max(20, e.props.bodyColumns)
-  const labelWidth = Math.max(10, width - 12)
 
   const select = (id: string) => {
     void update($, confirmDeleteId, () => null)
@@ -450,12 +448,21 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
       </Box>
       <Text dimColor>{rule}</Text>
 
-      {shown.length === 0 && (
-        <Text dimColor wrap="wrap">
-          {list.length === 0
-            ? '저장된 핀이 없습니다. /pin 으로 마지막 답변의 표·링크를 저장하거나, 아래 후보에서 고르세요.'
-            : '이 필터에 맞는 핀이 없습니다. f 로 필터를 바꾸세요.'}
-        </Text>
+      {list.length === 0 && (
+        <Box flexDirection="column" paddingX={2} marginY={1}>
+          <Text bold>아직 핀이 없어요</Text>
+          {EMPTY_HINTS.map(([how, what]) => (
+            <Text>
+              <Text color={ACCENT}>{padCells(how, 16)}</Text>
+              <Text dimColor>{what}</Text>
+            </Text>
+          ))}
+        </Box>
+      )}
+      {list.length > 0 && shown.length === 0 && (
+        <Box paddingX={2} marginY={1}>
+          <Text dimColor>이 필터에 맞는 핀이 없어요 · f 로 다음 필터</Text>
+        </Box>
       )}
 
       {shown.slice(0, MAX_ROWS).map((p, i) => {
@@ -571,53 +578,77 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
 
       {removed && (
         <Box marginTop={1}>
+          <Text color="warning">↩ </Text>
           <Button
             key="undo"
             hotkey="u"
             plain
-            dimColor
-            label={`되돌리기: ${describe(removed)}`.slice(0, labelWidth)}
+            label="되돌리기"
             onPress={() => {
               void undo($)
             }}
           />
+          <Text dimColor> {fitWidth(removed.title, width - 16)}</Text>
         </Box>
       )}
 
       {cands.length > 0 && (
         <Box flexDirection="column" marginTop={1}>
-          <Text bold dimColor>
-            최근 후보 (이번 세션, 누르면 저장)
-          </Text>
+          <Text dimColor>{labelledRule('이번 세션의 후보 · 누르면 저장', width)}</Text>
           {cands.map((c, i) => {
             const hotkey = CANDIDATE_HOTKEYS[i]
+            const age = shortAge(now, c.seenAt)
+            const room = width - 2 - 3 - 2 - (2 + textWidth(age))
             return (
-              <Box key={`cand:${c.id}`} gap={1}>
-                <Button
-                  key={`save:${c.id}`}
-                  {...(hotkey ? { hotkey } : {})}
-                  plain
-                  label={`+ ${GLYPH[c.kind]} ${c.title}`.slice(0, labelWidth)}
-                  onPress={() => {
-                    void addPins($, [{ kind: c.kind, title: c.title, body: c.body, sourceUuid: c.sourceUuid }])
-                  }}
-                />
-                <Text dimColor>{relativeTime(now, c.seenAt)}</Text>
+              <Box key={`cand:${c.id}`} justifyContent="space-between">
+                <Box>
+                  <Text color={ACCENT}>+ </Text>
+                  <Button
+                    key={`save:${c.id}`}
+                    {...(hotkey ? { hotkey } : {})}
+                    plain
+                    dimColor
+                    hover={{ dimColor: false }}
+                    label={fitWidth(c.title, room)}
+                    onPress={() => {
+                      void addPins($, [{ kind: c.kind, title: c.title, body: c.body, sourceUuid: c.sourceUuid }])
+                    }}
+                  />
+                </Box>
+                <Text>
+                  <Text color={KIND_COLOR[c.kind]}>{GLYPH[c.kind]}</Text> <Text dimColor>{age}</Text>
+                </Text>
               </Box>
             )
           })}
         </Box>
       )}
 
-      <Box marginTop={1}>
-        <Text dimColor wrap="wrap">
-          {e.props.isFocused
-            ? '1-9 선택 · a/s/d/g/h 후보 저장 · c 복사 · p 프롬프트 · x 삭제 · u 되돌리기 · f 필터 · Esc 프롬프트로'
-            : 'ctrl+x tab: 패널 포커스 · /pin help: 도움말'}
+      <Box flexDirection="column" marginTop={1}>
+        <Text dimColor>{rule}</Text>
+        <Text dimColor wrap="truncate-end">
+          {e.props.isFocused ? 'Esc 프롬프트로 · /pin help 도움말' : 'ctrl+x tab 으로 패널 조작 · /pin help 도움말'}
         </Text>
       </Box>
     </Box>
   )
+}
+
+const EMPTY_HINTS: [string, string][] = [
+  ['/pin', '마지막 답변의 표·링크 저장'],
+  ['"이 표 핀해줘"', '모델에게 말로 저장'],
+  ['a s d g h', '아래 후보에서 바로 저장'],
+]
+
+/** `text` followed by spaces up to `cells` cells (at least one). */
+function padCells(text: string, cells: number): string {
+  return text + ' '.repeat(Math.max(1, cells - textWidth(text)))
+}
+
+/** A rule with a label at its start: `─ label ─────`, `width` cells long. */
+function labelledRule(label: string, width: number): string {
+  const head = `─ ${label} `
+  return head + '─'.repeat(Math.max(0, width - textWidth(head)))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

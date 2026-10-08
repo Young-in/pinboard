@@ -184,8 +184,26 @@ test('a reply with a table becomes a candidate the pane saves on one press', asy
   await ui.press({ key: table!.key! })
   expect(world.pins()).toHaveLength(1)
   expect(world.pins()[0]).toMatchObject({ kind: 'table', title: '실험 결과' })
-  expect(await ui.find({ type: 'Button', text: /\+ ▤ 실험 결과/ })).toBeUndefined()
+  expect(await ui.find({ key: table!.key! })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /이번 세션의 후보/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('an empty board explains how to pin', async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'pinboard',
+      surface,
+      component: 'Pane',
+      requestId: 'pins',
+      props: PANE_PROPS,
+    })
+    expect(await ui.find({ type: 'Text', text: /아직 핀이 없어요/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^\/pin +$/ })).toBeDefined()
+    await ui.unmount()
+  }
 })
 
 test('a new candidate opens the pane unasked once; /pins opens it asked', async ($, on) => {
