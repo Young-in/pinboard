@@ -95,3 +95,7 @@ hooks/extract.ts                표·링크 추출, 제목 생성 (순수 함수
 hooks/*.test.ts(x)              테스트
 types/index.d.ts                세션 상태 계약 (PluginState)
 ```
+
+## 라이선스
+
+[MIT](LICENSE)
