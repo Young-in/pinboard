@@ -22,6 +22,7 @@ import {
   projectName,
   relativeTime,
 } from './extract'
+import { fitWidth, shortAge, textWidth } from './format'
 
 // ────────────────────────────────────────────────────────────────────────────
 // State, store and shared operations
@@ -378,6 +379,14 @@ async function togglePane($: Dollar): Promise<string> {
 
 const MAX_ROWS = 30
 const CANDIDATE_HOTKEYS = ['a', 's', 'd', 'g', 'h']
+// Theme keys, so the colors follow the person's light or dark theme.
+const ACCENT = 'claude'
+const KIND_COLOR: Record<PinboardKind, string> = {
+  table: 'suggestion',
+  artifact: 'merged',
+  link: 'ide',
+  text: 'subtle',
+}
 
 async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const { Box, Text, Button, Markdown, Link } = $.ui.resolve(e)
@@ -450,23 +459,37 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
       )}
 
       {shown.slice(0, MAX_ROWS).map((p, i) => {
-        const prefix = i < 9 ? '' : `${i + 1}. `
-        const label = `${prefix}${GLYPH[p.kind]} ${p.title}`.slice(0, labelWidth)
+        const isSelected = p.id === sel
+        const hotkey = i < 9 ? String(i + 1) : undefined
+        const age = shortAge(now, p.createdAt)
+        // marker 2 + "1: " 3 + gap 2 + glyph and age on the right
+        const room = width - 2 - 3 - 2 - (2 + textWidth(age))
+        const title = fitWidth(hotkey ? p.title : `${i + 1}. ${p.title}`, room)
         return (
-          <Box key={`row:${p.id}`} gap={1}>
-            <Button
-              key={`sel:${p.id}`}
-              {...(i < 9 ? { hotkey: String(i + 1) } : {})}
-              plain
-              dimColor={p.id !== sel}
-              label={label}
-              onPress={() => select(p.id)}
-            />
-            <Text dimColor>{relativeTime(now, p.createdAt)}</Text>
+          <Box key={`row:${p.id}`} justifyContent="space-between">
+            <Box>
+              <Text color={ACCENT}>{isSelected ? '▍ ' : '  '}</Text>
+              <Button
+                key={`sel:${p.id}`}
+                {...(hotkey ? { hotkey } : {})}
+                plain
+                dimColor={!isSelected}
+                hover={{ dimColor: false }}
+                label={title}
+                onPress={() => select(p.id)}
+              />
+            </Box>
+            <Text>
+              <Text color={KIND_COLOR[p.kind]}>{GLYPH[p.kind]}</Text> <Text dimColor>{age}</Text>
+            </Text>
           </Box>
         )
       })}
-      {shown.length > MAX_ROWS && <Text dimColor>… {shown.length - MAX_ROWS}개 더 (f 로 필터)</Text>}
+      {shown.length > MAX_ROWS && (
+        <Text dimColor>
+          {'  '}… {shown.length - MAX_ROWS}개 더 · f 로 필터
+        </Text>
+      )}
 
       {selected && (
         <Box flexDirection="column" marginTop={1} paddingX={1} borderStyle="round" borderDimColor>

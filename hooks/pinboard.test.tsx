@@ -1,6 +1,8 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { textWidth } from './format'
+
 const PANE_PROPS = {
   title: 'Pins',
   isFocused: true,
@@ -106,6 +108,32 @@ test('filter tabs show counts and narrow the list', async ($, on) => {
     expect(await ui.find({ key: `sel:${table!.id}` })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('rows fit long titles to the pane width and mark the selected one', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({
+    tool: 'mcp__pinboard__pin',
+    markdown: '| a |\n|---|\n| 1 |',
+    title: '아주 긴 제목이 패널 폭을 넘어가는 경우를 확인하기 위한 핀',
+  })
+  const id = world.pins()[0]!.id
+  const ui = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: { ...PANE_PROPS, bodyColumns: 30 },
+  })
+  const row = await ui.find({ key: `sel:${id}` })
+  expect(row?.text).toContain('…')
+  expect(textWidth(row?.text ?? '')).toBeLessThanOrEqual(30)
+  expect(await ui.find({ type: 'Text', text: /▍/ })).toBeDefined()
+
+  await ui.press({ key: `sel:${id}` })
+  expect(await ui.find({ type: 'Text', text: /▍/ })).toBeUndefined()
+  await ui.unmount()
 })
 
 test('unpin and list tools work by title and index', async ($, on) => {
