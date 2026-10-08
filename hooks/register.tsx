@@ -22,7 +22,7 @@ import {
   projectName,
   relativeTime,
 } from './extract'
-import { fitWidth, shortAge, textWidth } from './format'
+import { fitWidth, KIND_LABEL, localStamp, shortAge, textWidth } from './format'
 
 // ────────────────────────────────────────────────────────────────────────────
 // State, store and shared operations
@@ -299,11 +299,11 @@ async function runExport($: Dollar): Promise<string> {
   const list = await read($, pins)
   if (list.length === 0) return '내보낼 핀이 없습니다.'
   const home = (await $.env.get('HOME')) ?? '.'
-  const date = new Date(await $.clock.now()).toISOString().slice(0, 10)
+  const date = localStamp(await $.clock.now()).slice(0, 10)
   const path = `${home}/.claude/pins/pins-${date}.md`
   const sections = list.map(p => {
-    const when = new Date(p.createdAt).toISOString().slice(0, 16).replace('T', ' ')
-    return `## ${GLYPH[p.kind]} ${p.title}\n\n_${p.kind} · ${projectName(p.cwd)} · ${when}_\n\n${p.body}\n`
+    const meta = `${KIND_LABEL[p.kind]} · ${projectName(p.cwd)} · ${localStamp(p.createdAt)}`
+    return `## ${GLYPH[p.kind]} ${p.title}\n\n_${meta}_\n\n${p.body}\n`
   })
   try {
     await $.fs.write(path, [`# Pins (${list.length}) · ${date}`, '', ...sections].join('\n'))
@@ -492,65 +492,80 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
       )}
 
       {selected && (
-        <Box flexDirection="column" marginTop={1} paddingX={1} borderStyle="round" borderDimColor>
-          <Text bold wrap="truncate-end">
-            {GLYPH[selected.kind]} {selected.title}
+        <Box
+          flexDirection="column"
+          marginTop={1}
+          paddingX={1}
+          borderStyle="round"
+          borderColor={KIND_COLOR[selected.kind]}
+        >
+          <Text bold>
+            <Text color={KIND_COLOR[selected.kind]}>{GLYPH[selected.kind]}</Text> {fitWidth(selected.title, width - 6)}
           </Text>
           <Text dimColor wrap="truncate-end">
-            {selected.kind} · {projectName(selected.cwd)} ·{' '}
-            {new Date(selected.createdAt).toISOString().slice(0, 16).replace('T', ' ')}
+            {KIND_LABEL[selected.kind]} · {projectName(selected.cwd)} · {localStamp(selected.createdAt)}
           </Text>
-          {selected.kind === 'link' || selected.kind === 'artifact' ? (
-            <Link href={selected.body} />
-          ) : (
-            <Markdown text={selected.body} />
-          )}
-          <Box gap={1} marginTop={1} flexWrap="wrap">
-            <Button
-              key="copy"
-              hotkey="c"
-              label="복사"
-              onPress={press => {
-                void $.ui
-                  .copy({ text: selected.body, surface: press.surface })
-                  .then(r => $.ui.toast(r.isCopied ? '복사됨' : `복사 실패: ${r.reason}`))
-              }}
-            />
-            <Button
-              key="prompt"
-              hotkey="p"
-              label="프롬프트에 넣기"
-              onPress={() => {
-                void $.prompt.fill({ text: `${selected.body}\n`, mode: 'insert' })
-              }}
-            />
-            {confirm === selected.id ? (
-              <Box gap={1}>
-                <Button
-                  key="delete-yes"
-                  hotkey="x"
-                  variant="primary"
-                  label="정말 삭제"
-                  onPress={() => {
-                    void removePin($, selected.id)
-                  }}
-                />
-                <Button
-                  key="delete-no"
-                  hotkey="o"
-                  label="취소"
-                  onPress={() => void update($, confirmDeleteId, () => null)}
-                />
-              </Box>
+          <Box marginY={1} flexDirection="column">
+            {selected.kind === 'link' || selected.kind === 'artifact' ? (
+              <Link href={selected.body} label={fitWidth(selected.body, width - 4)} />
             ) : (
+              <Markdown text={selected.body} />
+            )}
+          </Box>
+          {confirm === selected.id ? (
+            <Box columnGap={2} flexWrap="wrap">
+              <Text color="error" bold>
+                정말 삭제할까요?
+              </Text>
+              <Button
+                key="delete-yes"
+                hotkey="x"
+                plain
+                label="삭제"
+                onPress={() => {
+                  void removePin($, selected.id)
+                }}
+              />
+              <Button
+                key="delete-no"
+                hotkey="o"
+                plain
+                label="취소"
+                onPress={() => void update($, confirmDeleteId, () => null)}
+              />
+            </Box>
+          ) : (
+            <Box columnGap={2} flexWrap="wrap">
+              <Button
+                key="copy"
+                hotkey="c"
+                plain
+                label="복사"
+                onPress={press => {
+                  void $.ui
+                    .copy({ text: selected.body, surface: press.surface })
+                    .then(r => $.ui.toast(r.isCopied ? '복사됨' : `복사 실패: ${r.reason}`))
+                }}
+              />
+              <Button
+                key="prompt"
+                hotkey="p"
+                plain
+                label="프롬프트에 넣기"
+                onPress={() => {
+                  void $.prompt.fill({ text: `${selected.body}\n`, mode: 'insert' })
+                }}
+              />
               <Button
                 key="delete"
                 hotkey="x"
+                plain
+                dimColor
                 label="삭제"
                 onPress={() => void update($, confirmDeleteId, () => selected.id)}
               />
-            )}
-          </Box>
+            </Box>
+          )}
         </Box>
       )}
 

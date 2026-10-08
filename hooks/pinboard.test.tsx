@@ -67,8 +67,13 @@ test('pin tool stores a pin; the pane lists it, deletes on a second press, and u
     expect(await ui.find({ type: 'Button', key: `sel:${id}` })).toBeDefined()
     expect(await ui.find({ type: 'Markdown' })).toBeDefined()
 
+    expect(await ui.find({ type: 'Text', text: /^표 · proj · \d{4}-\d\d-\d\d \d\d:\d\d$/ })).toBeDefined()
+    expect(await ui.find({ key: 'copy' })).toBeDefined()
+
     await ui.press({ key: 'delete' })
     expect(await ui.find({ key: 'delete-yes' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /정말 삭제할까요/ })).toBeDefined()
+    expect(await ui.find({ key: 'copy' })).toBeUndefined()
     expect(world.pins()).toHaveLength(1)
 
     await ui.press({ key: 'delete-yes' })
