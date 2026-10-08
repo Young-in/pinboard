@@ -1,0 +1,13 @@
+{
+  "name": "youngin-mods",
+  "owner": {
+    "name": "youngin"
+  },
+  "plugins": [
+    {
+      "name": "pinboard",
+      "source": "./"
+    }
+  ],
+  "description": "youngin's Claude Code mods: pinboard (pin tables, artifact links and answers into a side pane)"
+}

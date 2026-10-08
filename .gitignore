@@ -1,0 +1,4 @@
+# Laid by Claude Code each time the mod loads (API typings for the editor and tsc); regenerated, never edited.
+.claude-plugin/types/
+/tsconfig.json
+node_modules/
