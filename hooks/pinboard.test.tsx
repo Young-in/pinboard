@@ -190,6 +190,61 @@ test('rows fit long titles to the pane width and mark the selected one', async (
   await ui.unmount()
 })
 
+test('pins are grouped by session, this session first, and the session tab narrows to it', async ($, on) => {
+  const world = engine(on, 'session-A')
+  world.store.set('pins', [foreignPin('b-1', 'B가 저장한 핀', { createdAt: Date.UTC(2026, 9, 12, 5, 0) })])
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'from A', title: 'A가 저장한 핀' })
+  const mine = world.pins().find(p => p.title === 'A가 저장한 핀')!
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'pinboard',
+      surface,
+      component: 'Pane',
+      requestId: 'pins',
+      props: PANE_PROPS,
+    })
+    expect(await ui.find({ type: 'Text', text: /^이 세션$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^다른 세션 · \d\d-\d\d \d\d:\d\d · proj$/ })).toBeDefined()
+    expect((await ui.find({ key: `sel:${mine.id}` }))?.props).toMatchObject({ hotkey: '1' })
+    expect((await ui.find({ key: 'sel:b-1' }))?.props).toMatchObject({ hotkey: '2' })
+
+    await ui.press({ key: 'tab:session' })
+    expect(await ui.find({ key: `sel:${mine.id}` })).toBeDefined()
+    expect(await ui.find({ key: 'sel:b-1' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^이 세션$/ })).toBeUndefined()
+    expect(world.store.get('filter')).toBe('session')
+
+    await ui.press({ key: 'tab:all' })
+    await ui.unmount()
+  }
+
+  await $.command.run({
+    command: 'unpin',
+    args: '2',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+  expect(world.pins().map(p => p.id)).toEqual([mine.id])
+})
+
+test('the chosen tab is remembered for the next session', async ($, on) => {
+  const world = engine(on)
+  world.store.set('filter', 'session')
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  const ui = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await ui.find({ type: 'Button', key: 'tab:session' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'tab:all' })).toBeDefined()
+  await ui.unmount()
+})
+
 test('unpin and list tools work by title and index', async ($, on) => {
   const world = engine(on)
   await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })

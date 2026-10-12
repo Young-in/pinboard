@@ -22,7 +22,7 @@ export type PinboardCandidate = {
   seenAt: number
 }
 
-export type PinboardFilter = 'all' | 'table' | 'artifact' | 'link' | 'project'
+export type PinboardFilter = 'all' | 'session' | 'project' | 'table' | 'artifact' | 'link'
 
 declare module 'claude-code' {
   interface PluginState {

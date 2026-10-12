@@ -41,9 +41,12 @@ const MAX_CANDIDATES = 8
 /** How often a session re-reads the shared store to show what other sessions pinned or removed. */
 const REFRESH_MS = 3_000
 
-const FILTERS: PinboardFilter[] = ['all', 'table', 'artifact', 'link', 'project']
+const STORE_FILTER = 'filter'
+
+const FILTERS: PinboardFilter[] = ['all', 'session', 'project', 'table', 'artifact', 'link']
 const FILTER_LABEL: Record<PinboardFilter, string> = {
   all: '전체',
+  session: '이 세션',
   table: '표',
   artifact: '아티팩트',
   link: '링크',
@@ -63,10 +66,49 @@ function newId(seed: number): string {
   return `${seed.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-function visible(list: PinboardPin[], f: PinboardFilter, cwd: string): PinboardPin[] {
+/** Where the pane is looked at from: the session's folder and id. */
+type Scope = { cwd: string; sessionId: string }
+
+async function currentScope($: Dollar): Promise<Scope> {
+  const [cwd, sessionId] = await Promise.all([$.session.cwd(), $.session.id()])
+  return { cwd, sessionId }
+}
+
+function isFilter(value: unknown): value is PinboardFilter {
+  return typeof value === 'string' && (FILTERS as string[]).includes(value)
+}
+
+function visible(list: PinboardPin[], f: PinboardFilter, scope: Scope): PinboardPin[] {
   if (f === 'all') return list
-  if (f === 'project') return list.filter(p => p.cwd === cwd)
+  if (f === 'session') return list.filter(p => p.sessionId === scope.sessionId)
+  if (f === 'project') return list.filter(p => p.cwd === scope.cwd)
   return list.filter(p => p.kind === f)
+}
+
+type PinGroup = { sessionId: string; isCurrent: boolean; label: string; pins: PinboardPin[] }
+
+/** Pins grouped by the session that saved them: this session first, then the others, most recent first. */
+function groupBySession(list: PinboardPin[], scope: Scope): PinGroup[] {
+  const bySession = new Map<string, PinboardPin[]>()
+  for (const p of [...list].sort((a, b) => b.createdAt - a.createdAt)) {
+    const group = bySession.get(p.sessionId)
+    if (group) group.push(p)
+    else bySession.set(p.sessionId, [p])
+  }
+  const groups = [...bySession].map(([sessionId, group]) => {
+    const isCurrent = sessionId === scope.sessionId
+    const oldest = group[group.length - 1]!
+    const label = isCurrent
+      ? '이 세션'
+      : `다른 세션 · ${localStamp(oldest.createdAt).slice(5)} · ${projectName(oldest.cwd)}`
+    return { sessionId, isCurrent, label, pins: group }
+  })
+  return groups.sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || b.pins[0]!.createdAt - a.pins[0]!.createdAt)
+}
+
+/** The pins a filter shows, in the order the pane numbers them. */
+function displayOrder(list: PinboardPin[], f: PinboardFilter, scope: Scope): PinboardPin[] {
+  return groupBySession(visible(list, f, scope), scope).flatMap(g => g.pins)
 }
 
 function describe(p: PinboardPin): string {
@@ -211,7 +253,7 @@ async function resolvePin($: Dollar, token: string): Promise<PinboardPin | undef
   if (!t || t === 'last') return list[0]
   const n = Number(t)
   if (Number.isInteger(n) && n >= 1) {
-    const shown = visible(list, await read($, filter), await $.session.cwd())
+    const shown = displayOrder(list, await read($, filter), await currentScope($))
     if (n <= shown.length) return shown[n - 1]
   }
   const lower = t.toLowerCase()
@@ -426,7 +468,7 @@ const KIND_COLOR: Record<PinboardKind, string> = {
 
 async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const { Box, Text, Button, Markdown, Link } = $.ui.resolve(e)
-  const [list, f, sel, cands, removed, confirm, now, cwd] = await Promise.all([
+  const [list, f, sel, cands, removed, confirm, now, scope] = await Promise.all([
     read($, pins),
     read($, filter),
     read($, selectedId),
@@ -434,9 +476,10 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
     read($, lastRemoved),
     read($, confirmDeleteId),
     $.clock.now(),
-    $.session.cwd(),
+    currentScope($),
   ])
-  const shown = visible(list, f, cwd)
+  const groups = groupBySession(visible(list, f, scope), scope)
+  const shown = groups.flatMap(g => g.pins)
   const selected = shown.find(p => p.id === sel) ?? null
   const width = Math.max(20, e.props.bodyColumns)
 
@@ -447,16 +490,71 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const setFilter = (next: PinboardFilter) => {
     void update($, selectedId, () => null)
     void update($, filter, () => next)
+    void $.store.set(STORE_FILTER, next)
   }
   const cycleFilter = () => setFilter(FILTERS[(FILTERS.indexOf(f) + 1) % FILTERS.length] ?? 'all')
   const counts: Record<PinboardFilter, number> = {
     all: list.length,
+    session: list.filter(p => p.sessionId === scope.sessionId).length,
+    project: list.filter(p => p.cwd === scope.cwd).length,
     table: list.filter(p => p.kind === 'table').length,
     artifact: list.filter(p => p.kind === 'artifact').length,
     link: list.filter(p => p.kind === 'link').length,
-    project: list.filter(p => p.cwd === cwd).length,
   }
   const rule = '─'.repeat(width)
+
+  const pinRow = (p: PinboardPin, i: number) => {
+    const isSelected = p.id === sel
+    const hotkey = i < 9 ? String(i + 1) : undefined
+    const age = shortAge(now, p.createdAt)
+    // marker 2 + "1: " 3 + gap 2 + glyph and age on the right
+    const room = width - 2 - 3 - 2 - (2 + textWidth(age))
+    const title = fitWidth(hotkey ? p.title : `${i + 1}. ${p.title}`, room)
+    return (
+      <Box key={`row:${p.id}`} justifyContent="space-between">
+        <Box>
+          <Text color={ACCENT}>{isSelected ? '▍ ' : '  '}</Text>
+          <Button
+            key={`sel:${p.id}`}
+            {...(hotkey ? { hotkey } : {})}
+            plain
+            dimColor={!isSelected}
+            hover={{ dimColor: false }}
+            label={title}
+            onPress={() => select(p.id)}
+          />
+        </Box>
+        <Text>
+          <Text color={KIND_COLOR[p.kind]}>{GLYPH[p.kind]}</Text> <Text dimColor>{age}</Text>
+        </Text>
+      </Box>
+    )
+  }
+
+  // Rows in display order, with a header per session when more than one session's pins are shown.
+  const rows: ReturnType<typeof pinRow>[] = []
+  let index = 0
+  for (const g of groups) {
+    if (index >= MAX_ROWS) break
+    if (groups.length > 1) {
+      rows.push(
+        <Box key={`group:${g.sessionId}`} marginTop={index === 0 ? 0 : 1}>
+          {g.isCurrent ? (
+            <Text color={ACCENT} bold>
+              {fitWidth(g.label, width)}
+            </Text>
+          ) : (
+            <Text dimColor>{fitWidth(g.label, width)}</Text>
+          )}
+        </Box>,
+      )
+    }
+    for (const p of g.pins) {
+      if (index >= MAX_ROWS) break
+      rows.push(pinRow(p, index))
+      index++
+    }
+  }
 
   return (
     <Box flexDirection="column">
@@ -502,33 +600,7 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
         </Box>
       )}
 
-      {shown.slice(0, MAX_ROWS).map((p, i) => {
-        const isSelected = p.id === sel
-        const hotkey = i < 9 ? String(i + 1) : undefined
-        const age = shortAge(now, p.createdAt)
-        // marker 2 + "1: " 3 + gap 2 + glyph and age on the right
-        const room = width - 2 - 3 - 2 - (2 + textWidth(age))
-        const title = fitWidth(hotkey ? p.title : `${i + 1}. ${p.title}`, room)
-        return (
-          <Box key={`row:${p.id}`} justifyContent="space-between">
-            <Box>
-              <Text color={ACCENT}>{isSelected ? '▍ ' : '  '}</Text>
-              <Button
-                key={`sel:${p.id}`}
-                {...(hotkey ? { hotkey } : {})}
-                plain
-                dimColor={!isSelected}
-                hover={{ dimColor: false }}
-                label={title}
-                onPress={() => select(p.id)}
-              />
-            </Box>
-            <Text>
-              <Text color={KIND_COLOR[p.kind]}>{GLYPH[p.kind]}</Text> <Text dimColor>{age}</Text>
-            </Text>
-          </Box>
-        )
-      })}
+      {rows}
       {shown.length > MAX_ROWS && (
         <Text dimColor>
           {'  '}… {shown.length - MAX_ROWS}개 더 · f 로 필터
@@ -760,6 +832,8 @@ export const register: Register = on => {
     // The store is the truth; session state mirrors it so the pane redraws on every change. The timer
     // picks up what other sessions pin or remove while this one runs.
     const list = await refreshPins($)
+    const savedFilter = await $.store.get(STORE_FILTER)
+    if (isFilter(savedFilter)) await update($, filter, () => savedFilter)
     $.clock.every(REFRESH_MS, () => {
       void refreshPins($).catch(() => undefined)
     })
