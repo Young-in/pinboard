@@ -28,7 +28,9 @@ import { fitWidth, KIND_LABEL, localStamp, shortAge, textWidth } from './format'
 // ────────────────────────────────────────────────────────────────────────────
 
 type Dollar = EngineInterface
-type PinInput = { kind: PinboardKind; title: string; body: string; sourceUuid?: string }
+/** Which agent an item came from: a subagent's or teammate's id and the name it is shown by. */
+type AgentTag = { agentId?: string; agentLabel?: string }
+type PinInput = { kind: PinboardKind; title: string; body: string; sourceUuid?: string } & AgentTag
 
 const PANE = 'pins'
 const PANE_TITLE = 'Pins'
@@ -38,10 +40,15 @@ const STORE_AUTO_OPEN = 'autoOpen'
 const MAX_PINS = 200
 const MAX_BODY = 20_000
 const MAX_CANDIDATES = 8
+/** How often a session re-reads the shared store to show what other sessions pinned or removed. */
+const REFRESH_MS = 3_000
 
-const FILTERS: PinboardFilter[] = ['all', 'table', 'artifact', 'link', 'project']
+const STORE_FILTER = 'filter'
+
+const FILTERS: PinboardFilter[] = ['all', 'session', 'project', 'table', 'artifact', 'link']
 const FILTER_LABEL: Record<PinboardFilter, string> = {
   all: '전체',
+  session: '이 세션',
   table: '표',
   artifact: '아티팩트',
   link: '링크',
@@ -61,91 +68,192 @@ function newId(seed: number): string {
   return `${seed.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-function visible(list: PinboardPin[], f: PinboardFilter, cwd: string): PinboardPin[] {
-  if (f === 'all') return list
-  if (f === 'project') return list.filter(p => p.cwd === cwd)
-  return list.filter(p => p.kind === f)
+/**
+ * The agent whose transcript the person last had in view beside the pane, as the pane's last drawing saw it;
+ * undefined for the main conversation. Commands read it, since only a drawing is told which view is on screen.
+ * A module variable on purpose: a hint about the screen, fine to lose on a reload.
+ */
+let viewedAgentId: string | undefined
+
+/** Where the pane is looked at from: the session's folder and id, and the agent in view if any. */
+type Scope = { cwd: string; sessionId: string; agentId?: string }
+
+async function currentScope($: Dollar, agentId = viewedAgentId): Promise<Scope> {
+  const [cwd, sessionId] = await Promise.all([$.session.cwd(), $.session.id()])
+  return agentId ? { cwd, sessionId, agentId } : { cwd, sessionId }
+}
+
+function isFilter(value: unknown): value is PinboardFilter {
+  return typeof value === 'string' && (FILTERS as string[]).includes(value)
+}
+
+/** The pins of the view: one agent's while its transcript is in view, else every pin. */
+function inView(list: PinboardPin[], scope: Scope): PinboardPin[] {
+  return scope.agentId ? list.filter(p => p.agentId === scope.agentId) : list
+}
+
+function visible(list: PinboardPin[], f: PinboardFilter, scope: Scope): PinboardPin[] {
+  const base = inView(list, scope)
+  if (f === 'all') return base
+  if (f === 'session') return base.filter(p => p.sessionId === scope.sessionId)
+  if (f === 'project') return base.filter(p => p.cwd === scope.cwd)
+  return base.filter(p => p.kind === f)
+}
+
+/** The name an agent is shown by: its SendMessage name, its task description, or its type. */
+async function agentLabelOf($: Dollar, agentId: string): Promise<string> {
+  try {
+    const agent = (await $.agent.list()).find(a => a.id === agentId)
+    const label = agent?.name || agent?.description || agent?.type
+    if (label) return label
+  } catch {
+    // the roster is a nicety; fall back to the id
+  }
+  return `에이전트 ${agentId.slice(0, 6)}`
+}
+
+async function agentTag($: Dollar, agentId: string | undefined): Promise<AgentTag> {
+  return agentId ? { agentId, agentLabel: await agentLabelOf($, agentId) } : {}
+}
+
+type PinGroup = { sessionId: string; isCurrent: boolean; label: string; pins: PinboardPin[] }
+
+/** Pins grouped by the session that saved them: this session first, then the others, most recent first. */
+function groupBySession(list: PinboardPin[], scope: Scope): PinGroup[] {
+  const bySession = new Map<string, PinboardPin[]>()
+  for (const p of [...list].sort((a, b) => b.createdAt - a.createdAt)) {
+    const group = bySession.get(p.sessionId)
+    if (group) group.push(p)
+    else bySession.set(p.sessionId, [p])
+  }
+  const groups = [...bySession].map(([sessionId, group]) => {
+    const isCurrent = sessionId === scope.sessionId
+    const oldest = group[group.length - 1]!
+    const label = isCurrent
+      ? '이 세션'
+      : `다른 세션 · ${localStamp(oldest.createdAt).slice(5)} · ${projectName(oldest.cwd)}`
+    return { sessionId, isCurrent, label, pins: group }
+  })
+  return groups.sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || b.pins[0]!.createdAt - a.pins[0]!.createdAt)
+}
+
+/** The pins a filter shows, in the order the pane numbers them. */
+function displayOrder(list: PinboardPin[], f: PinboardFilter, scope: Scope): PinboardPin[] {
+  return groupBySession(visible(list, f, scope), scope).flatMap(g => g.pins)
 }
 
 function describe(p: PinboardPin): string {
   return `${GLYPH[p.kind]} ${p.title}`
 }
 
-/** Writes the list to session state (redraws the pane) and to the store (survives the session). */
-async function persist($: Dollar, list: PinboardPin[]): Promise<void> {
-  await update($, pins, () => list)
-  await $.store.set(STORE_PINS, list)
+// Every session of one installed copy shares one list in `$.store`. The store is the truth: each change
+// reads it right before writing, and `refreshPins` mirrors it into session state, where the pane reads it.
+
+/** The pins as the store holds them now. */
+async function loadPins($: Dollar): Promise<PinboardPin[]> {
+  const stored = await $.store.get(STORE_PINS)
+  return Array.isArray(stored) ? (stored as PinboardPin[]) : []
+}
+
+function signature(list: readonly PinboardPin[]): string {
+  return list.map(p => p.id).join(',')
+}
+
+/** Mirrors the store into session state when another session changed it, so the pane redraws. */
+async function refreshPins($: Dollar): Promise<PinboardPin[]> {
+  const fresh = await loadPins($)
+  const mirrored = await read($, pins)
+  if (signature(fresh) !== signature(mirrored)) await update($, pins, () => fresh)
+  return fresh
+}
+
+/**
+ * Changes the shared list: reads the store fresh, applies `change`, writes the result back and mirrors it.
+ * Reading right before writing keeps what other sessions saved meanwhile. `change` returning its input
+ * unchanged writes nothing.
+ */
+async function mutatePins($: Dollar, change: (list: PinboardPin[]) => PinboardPin[]): Promise<PinboardPin[]> {
+  const list = await loadPins($)
+  const next = change(list)
+  if (next !== list) await $.store.set(STORE_PINS, next.slice(0, MAX_PINS))
+  await update($, pins, () => next.slice(0, MAX_PINS))
+  return next
 }
 
 /** Adds the items not already pinned (same body, whitespace aside), newest first; returns what was added. */
 async function addPins($: Dollar, items: PinInput[]): Promise<PinboardPin[]> {
-  const [now, sessionId, cwd, current] = await Promise.all([
-    $.clock.now(),
-    $.session.id(),
-    $.session.cwd(),
-    read($, pins),
-  ])
-  const known = new Set(current.map(p => bodyKey(p.body)))
+  const [now, sessionId, cwd] = await Promise.all([$.clock.now(), $.session.id(), $.session.cwd()])
   const added: PinboardPin[] = []
-  for (const it of items) {
-    const body = it.body.length > MAX_BODY ? `${it.body.slice(0, MAX_BODY)}\n\n…(잘림)` : it.body
-    const key = bodyKey(body)
-    if (!key || known.has(key)) continue
-    known.add(key)
-    const pin: PinboardPin = {
-      id: newId(now + added.length),
-      createdAt: now,
-      sessionId,
-      cwd,
-      kind: it.kind,
-      title: it.title || firstLineTitle(body),
-      body,
+  await mutatePins($, current => {
+    const known = new Set(current.map(p => bodyKey(p.body)))
+    for (const it of items) {
+      const body = it.body.length > MAX_BODY ? `${it.body.slice(0, MAX_BODY)}\n\n…(잘림)` : it.body
+      const key = bodyKey(body)
+      if (!key || known.has(key)) continue
+      known.add(key)
+      const pin: PinboardPin = {
+        id: newId(now + added.length),
+        createdAt: now,
+        sessionId,
+        cwd,
+        kind: it.kind,
+        title: it.title || firstLineTitle(body),
+        body,
+      }
+      if (it.sourceUuid) pin.sourceUuid = it.sourceUuid
+      if (it.agentId) pin.agentId = it.agentId
+      if (it.agentLabel) pin.agentLabel = it.agentLabel
+      added.push(pin)
     }
-    if (it.sourceUuid) pin.sourceUuid = it.sourceUuid
-    added.push(pin)
-  }
+    return added.length > 0 ? [...added, ...current] : current
+  })
   if (added.length === 0) return []
-  await persist($, [...added, ...current].slice(0, MAX_PINS))
+  const addedKeys = new Set(added.map(p => bodyKey(p.body)))
   await update($, selectedId, () => added[0]?.id ?? null)
   await update($, confirmDeleteId, () => null)
-  await update($, candidates, list => list.filter(c => !known.has(bodyKey(c.body))))
+  await update($, candidates, list => list.filter(c => !addedKeys.has(bodyKey(c.body))))
   return added
 }
 
 /** Removes one pin and keeps it as `lastRemoved` for undo. */
 async function removePin($: Dollar, id: string): Promise<PinboardPin | undefined> {
-  const current = await read($, pins)
-  const target = current.find(p => p.id === id)
+  let target: PinboardPin | undefined
+  await mutatePins($, current => {
+    target = current.find(p => p.id === id)
+    return target ? current.filter(p => p.id !== id) : current
+  })
   if (!target) return undefined
-  await persist(
-    $,
-    current.filter(p => p.id !== id),
-  )
-  await update($, lastRemoved, () => target)
+  const removed = target
+  await update($, lastRemoved, () => removed)
   await update($, confirmDeleteId, () => null)
   await update($, selectedId, cur => (cur === id ? null : cur))
-  return target
+  return removed
 }
 
 /** Restores the last removed pin, or the backup `/pin clear` left. */
 async function undo($: Dollar): Promise<string> {
   const removed = await read($, lastRemoved)
   if (removed) {
-    const current = await read($, pins)
-    if (!current.some(p => p.id === removed.id)) await persist($, [removed, ...current].slice(0, MAX_PINS))
+    await mutatePins($, current =>
+      current.some(p => p.id === removed.id)
+        ? current
+        : [removed, ...current].sort((a, b) => b.createdAt - a.createdAt),
+    )
     await update($, lastRemoved, () => null)
     await update($, selectedId, () => removed.id)
     return `↩ 되돌림: ${describe(removed)}`
   }
   const backup = await $.store.get(STORE_BACKUP)
   if (Array.isArray(backup) && backup.length > 0) {
-    const current = await read($, pins)
-    const ids = new Set(current.map(p => p.id))
-    const restored = (backup as PinboardPin[]).filter(p => !ids.has(p.id))
-    const merged = [...current, ...restored].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_PINS)
-    await persist($, merged)
+    let restored = 0
+    await mutatePins($, current => {
+      const ids = new Set(current.map(p => p.id))
+      const back = (backup as PinboardPin[]).filter(p => !ids.has(p.id))
+      restored = back.length
+      return [...current, ...back].sort((a, b) => b.createdAt - a.createdAt)
+    })
     await $.store.delete(STORE_BACKUP)
-    return `↩ 되돌림: 핀 ${restored.length}개 복구`
+    return `↩ 되돌림: 핀 ${restored}개 복구`
   }
   return '되돌릴 핀이 없습니다.'
 }
@@ -173,21 +281,22 @@ async function openPane($: Dollar, options: { asked: boolean; focus?: boolean })
 
 /** A pin by its number in the pane (filtered, newest first), `last`, its id, or a title substring. */
 async function resolvePin($: Dollar, token: string): Promise<PinboardPin | undefined> {
-  const list = await read($, pins)
+  const list = await refreshPins($)
   const t = token.trim()
   if (!t || t === 'last') return list[0]
   const n = Number(t)
   if (Number.isInteger(n) && n >= 1) {
-    const shown = visible(list, await read($, filter), await $.session.cwd())
+    const shown = displayOrder(list, await read($, filter), await currentScope($))
     if (n <= shown.length) return shown[n - 1]
   }
   const lower = t.toLowerCase()
   return list.find(p => p.id === t) ?? list.find(p => p.title.toLowerCase().includes(lower))
 }
 
-/** The newest assistant message with text, or undefined before the first reply. */
-async function lastAnswer($: Dollar): Promise<string | undefined> {
-  const messages = await $.session.messages()
+/** The newest assistant message with text in the main conversation, or in one agent's; undefined before any. */
+async function lastAnswer($: Dollar, agentId?: string): Promise<string | undefined> {
+  const messages = agentId ? await $.session.messages({ agentId }) : await $.session.messages()
+  if (!Array.isArray(messages)) return undefined
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
     if (m && m.role === 'assistant' && m.text.trim()) return m.text
@@ -211,18 +320,26 @@ const HELP = [
   '/pin export         ~/.claude/pins/pins-<날짜>.md 로 내보내기',
   '/pin auto on|off    세션 시작·새 후보 감지 시 패널 자동 열기',
   '/pins               패널 열기/닫기',
+  '세션: 전체 보기는 세션별로 묶임 · "이 세션" 탭은 지금 세션 핀만',
+  '에이전트: 그 에이전트 화면을 보는 동안(패널 열림) 패널과 /pin 은 그 에이전트 기준',
   '패널 단축키(ctrl+x tab 으로 포커스): 1~9 선택 · a/s/d/g/h 후보 저장 · c 복사 · p 프롬프트에 넣기 · x 삭제 · u 되돌리기 · f 필터',
 ].join('\n')
 
-function report(added: Awaited<ReturnType<typeof addPins>>): string {
+function report(added: Awaited<ReturnType<typeof addPins>>, tag: AgentTag = {}): string {
+  const from = tag.agentLabel ? ` (에이전트 ${tag.agentLabel})` : ''
   if (added.length === 0) return '이미 저장된 내용입니다.'
-  if (added.length === 1) return `📌 저장: ${describe(added[0]!)}`
-  return `📌 ${added.length}개 저장:\n${added.map(p => `  ${describe(p)}`).join('\n')}`
+  if (added.length === 1) return `📌 저장${from}: ${describe(added[0]!)}`
+  return `📌 ${added.length}개 저장${from}:\n${added.map(p => `  ${describe(p)}`).join('\n')}`
 }
 
+/**
+ * Pins from the last answer of the transcript in view: the main conversation's, or the agent's whose
+ * transcript the pane last showed beside it.
+ */
 async function pinFromAnswer($: Dollar, mode: 'auto' | 'all' | 'links' | 'tables', title: string): Promise<string> {
-  const text = await lastAnswer($)
-  if (!text) return '저장할 답변이 없습니다.'
+  const tag = await agentTag($, viewedAgentId)
+  const text = await lastAnswer($, tag.agentId)
+  if (!text) return tag.agentId ? '이 에이전트에서 저장할 답변이 없습니다.' : '저장할 답변이 없습니다.'
   let items: PinInput[]
   if (mode === 'all') items = [{ kind: classify(text), title: title || firstLineTitle(text), body: text.trim() }]
   else if (mode === 'links') items = extractLinks(text, false)
@@ -236,9 +353,12 @@ async function pinFromAnswer($: Dollar, mode: 'auto' | 'all' | 'links' | 'tables
     const n = items.length
     items = items.map((it, i) => ({ ...it, title: n > 1 ? `${title} (${i + 1}/${n})` : title }))
   }
-  const added = await addPins($, items)
+  const added = await addPins(
+    $,
+    items.map(it => ({ ...it, ...tag })),
+  )
   await openPane($, { asked: true })
-  return report(added)
+  return report(added, tag)
 }
 
 /** `/pin [title]`: the mouse selection when there is one, else the last answer's tables and artifact links. */
@@ -251,11 +371,12 @@ async function pinDefault($: Dollar, title: string): Promise<string> {
   }
   const text = selected?.text.trim() ?? ''
   if (text) {
-    const item: PinInput = { kind: classify(text), title: title || firstLineTitle(text), body: text }
+    const tag = await agentTag($, viewedAgentId)
+    const item: PinInput = { kind: classify(text), title: title || firstLineTitle(text), body: text, ...tag }
     if (selected?.requestId) item.sourceUuid = selected.requestId
     const added = await addPins($, [item])
     await openPane($, { asked: true })
-    return report(added)
+    return report(added, tag)
   }
   return pinFromAnswer($, 'auto', title)
 }
@@ -276,7 +397,7 @@ async function runShow($: Dollar, token: string): Promise<string> {
 }
 
 async function runClear($: Dollar, rest: string): Promise<string> {
-  const list = await read($, pins)
+  const list = await refreshPins($)
   if (list.length === 0) return '저장된 핀이 없습니다.'
   let ok = rest.trim() === '--yes'
   if (!ok) {
@@ -287,15 +408,19 @@ async function runClear($: Dollar, rest: string): Promise<string> {
     }
   }
   if (!ok) return '취소됨'
-  await $.store.set(STORE_BACKUP, list)
-  await persist($, [])
+  let cleared: PinboardPin[] = []
+  await mutatePins($, current => {
+    cleared = current
+    return []
+  })
+  await $.store.set(STORE_BACKUP, cleared)
   await update($, selectedId, () => null)
   await update($, lastRemoved, () => null)
-  return `🗑 핀 ${list.length}개 삭제 (/pin undo 로 복구)`
+  return `🗑 핀 ${cleared.length}개 삭제 (/pin undo 로 복구)`
 }
 
 async function runExport($: Dollar): Promise<string> {
-  const list = await read($, pins)
+  const list = await refreshPins($)
   if (list.length === 0) return '내보낼 핀이 없습니다.'
   const home = (await $.env.get('HOME')) ?? '.'
   const date = localStamp(await $.clock.now()).slice(0, 10)
@@ -389,7 +514,10 @@ const KIND_COLOR: Record<PinboardKind, string> = {
 
 async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const { Box, Text, Button, Markdown, Link } = $.ui.resolve(e)
-  const [list, f, sel, cands, removed, confirm, now, cwd] = await Promise.all([
+  // Only a drawing is told which transcript is on screen; remember it for /pin and /unpin.
+  const viewAgent = e.props.view.agentId
+  viewedAgentId = viewAgent
+  const [list, f, sel, allCands, removed, confirm, now, scope, viewLabel] = await Promise.all([
     read($, pins),
     read($, filter),
     read($, selectedId),
@@ -397,10 +525,15 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
     read($, lastRemoved),
     read($, confirmDeleteId),
     $.clock.now(),
-    $.session.cwd(),
+    currentScope($, viewAgent),
+    viewAgent ? agentLabelOf($, viewAgent) : Promise.resolve(undefined),
   ])
-  const shown = visible(list, f, cwd)
+  const base = inView(list, scope)
+  const groups = groupBySession(visible(list, f, scope), scope)
+  const shown = groups.flatMap(g => g.pins)
   const selected = shown.find(p => p.id === sel) ?? null
+  // The main view offers the main conversation's candidates; an agent's view offers that agent's.
+  const cands = allCands.filter(c => c.agentId === viewAgent)
   const width = Math.max(20, e.props.bodyColumns)
 
   const select = (id: string) => {
@@ -410,25 +543,91 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const setFilter = (next: PinboardFilter) => {
     void update($, selectedId, () => null)
     void update($, filter, () => next)
+    void $.store.set(STORE_FILTER, next)
   }
   const cycleFilter = () => setFilter(FILTERS[(FILTERS.indexOf(f) + 1) % FILTERS.length] ?? 'all')
   const counts: Record<PinboardFilter, number> = {
-    all: list.length,
-    table: list.filter(p => p.kind === 'table').length,
-    artifact: list.filter(p => p.kind === 'artifact').length,
-    link: list.filter(p => p.kind === 'link').length,
-    project: list.filter(p => p.cwd === cwd).length,
+    all: base.length,
+    session: base.filter(p => p.sessionId === scope.sessionId).length,
+    project: base.filter(p => p.cwd === scope.cwd).length,
+    table: base.filter(p => p.kind === 'table').length,
+    artifact: base.filter(p => p.kind === 'artifact').length,
+    link: base.filter(p => p.kind === 'link').length,
   }
   const rule = '─'.repeat(width)
+
+  const pinRow = (p: PinboardPin, i: number) => {
+    const isSelected = p.id === sel
+    const hotkey = i < 9 ? String(i + 1) : undefined
+    const age = shortAge(now, p.createdAt)
+    // In the main view a pin an agent saved names the agent beside its age.
+    const badge = !viewAgent && p.agentLabel ? fitWidth(`@${p.agentLabel}`, 14) : ''
+    // marker 2 + "1: " 3 + gap 2 + glyph and age on the right (+ the badge)
+    const room = width - 2 - 3 - 2 - (2 + textWidth(age)) - (badge ? textWidth(badge) + 1 : 0)
+    const title = fitWidth(hotkey ? p.title : `${i + 1}. ${p.title}`, room)
+    return (
+      <Box key={`row:${p.id}`} justifyContent="space-between">
+        <Box>
+          <Text color={ACCENT}>{isSelected ? '▍ ' : '  '}</Text>
+          <Button
+            key={`sel:${p.id}`}
+            {...(hotkey ? { hotkey } : {})}
+            plain
+            dimColor={!isSelected}
+            hover={{ dimColor: false }}
+            label={title}
+            onPress={() => select(p.id)}
+          />
+        </Box>
+        <Text>
+          {badge ? <Text dimColor>{badge} </Text> : null}
+          <Text color={KIND_COLOR[p.kind]}>{GLYPH[p.kind]}</Text> <Text dimColor>{age}</Text>
+        </Text>
+      </Box>
+    )
+  }
+
+  // Rows in display order, with a header per session when more than one session's pins are shown.
+  const rows: ReturnType<typeof pinRow>[] = []
+  let index = 0
+  for (const g of groups) {
+    if (index >= MAX_ROWS) break
+    if (groups.length > 1) {
+      rows.push(
+        <Box key={`group:${g.sessionId}`} marginTop={index === 0 ? 0 : 1}>
+          {g.isCurrent ? (
+            <Text color={ACCENT} bold>
+              {fitWidth(g.label, width)}
+            </Text>
+          ) : (
+            <Text dimColor>{fitWidth(g.label, width)}</Text>
+          )}
+        </Box>,
+      )
+    }
+    for (const p of g.pins) {
+      if (index >= MAX_ROWS) break
+      rows.push(pinRow(p, index))
+      index++
+    }
+  }
 
   return (
     <Box flexDirection="column">
       <Box justifyContent="space-between">
         <Text bold>
-          Pins <Text dimColor>{list.length}</Text>
+          Pins <Text dimColor>{base.length}</Text>
         </Text>
         <Button key="filter" hotkey="f" plain dimColor label="다음 필터" onPress={cycleFilter} />
       </Box>
+      {viewLabel ? (
+        <Text wrap="truncate-end">
+          <Text color={ACCENT} bold>
+            ↳ {viewLabel}
+          </Text>
+          <Text dimColor> 에이전트의 핀과 후보만 보여요</Text>
+        </Text>
+      ) : null}
       <Box flexWrap="wrap" columnGap={2}>
         {FILTERS.map(name =>
           name === f ? (
@@ -448,9 +647,9 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
       </Box>
       <Text dimColor>{rule}</Text>
 
-      {list.length === 0 && (
+      {base.length === 0 && (
         <Box flexDirection="column" paddingX={2} marginY={1}>
-          <Text bold>아직 핀이 없어요</Text>
+          <Text bold>{viewAgent ? '이 에이전트의 핀이 아직 없어요' : '아직 핀이 없어요'}</Text>
           {EMPTY_HINTS.map(([how, what]) => (
             <Text>
               <Text color={ACCENT}>{padCells(how, 16)}</Text>
@@ -459,39 +658,13 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
           ))}
         </Box>
       )}
-      {list.length > 0 && shown.length === 0 && (
+      {base.length > 0 && shown.length === 0 && (
         <Box paddingX={2} marginY={1}>
           <Text dimColor>이 필터에 맞는 핀이 없어요 · f 로 다음 필터</Text>
         </Box>
       )}
 
-      {shown.slice(0, MAX_ROWS).map((p, i) => {
-        const isSelected = p.id === sel
-        const hotkey = i < 9 ? String(i + 1) : undefined
-        const age = shortAge(now, p.createdAt)
-        // marker 2 + "1: " 3 + gap 2 + glyph and age on the right
-        const room = width - 2 - 3 - 2 - (2 + textWidth(age))
-        const title = fitWidth(hotkey ? p.title : `${i + 1}. ${p.title}`, room)
-        return (
-          <Box key={`row:${p.id}`} justifyContent="space-between">
-            <Box>
-              <Text color={ACCENT}>{isSelected ? '▍ ' : '  '}</Text>
-              <Button
-                key={`sel:${p.id}`}
-                {...(hotkey ? { hotkey } : {})}
-                plain
-                dimColor={!isSelected}
-                hover={{ dimColor: false }}
-                label={title}
-                onPress={() => select(p.id)}
-              />
-            </Box>
-            <Text>
-              <Text color={KIND_COLOR[p.kind]}>{GLYPH[p.kind]}</Text> <Text dimColor>{age}</Text>
-            </Text>
-          </Box>
-        )
-      })}
+      {rows}
       {shown.length > MAX_ROWS && (
         <Text dimColor>
           {'  '}… {shown.length - MAX_ROWS}개 더 · f 로 필터
@@ -511,6 +684,7 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
           </Text>
           <Text dimColor wrap="truncate-end">
             {KIND_LABEL[selected.kind]} · {projectName(selected.cwd)} · {localStamp(selected.createdAt)}
+            {selected.agentLabel ? ` · 에이전트 ${selected.agentLabel}` : ''}
           </Text>
           <Box marginY={1} flexDirection="column">
             {selected.kind === 'link' || selected.kind === 'artifact' ? (
@@ -594,7 +768,9 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
 
       {cands.length > 0 && (
         <Box flexDirection="column" marginTop={1}>
-          <Text dimColor>{labelledRule('이번 세션의 후보 · 누르면 저장', width)}</Text>
+          <Text dimColor>
+            {labelledRule(viewAgent ? '이 에이전트의 후보 · 누르면 저장' : '이번 세션의 후보 · 누르면 저장', width)}
+          </Text>
           {cands.map((c, i) => {
             const hotkey = CANDIDATE_HOTKEYS[i]
             const age = shortAge(now, c.seenAt)
@@ -611,7 +787,10 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
                     hover={{ dimColor: false }}
                     label={fitWidth(c.title, room)}
                     onPress={() => {
-                      void addPins($, [{ kind: c.kind, title: c.title, body: c.body, sourceUuid: c.sourceUuid }])
+                      const tag: AgentTag = c.agentId ? { agentId: c.agentId, agentLabel: c.agentLabel ?? '' } : {}
+                      void addPins($, [
+                        { kind: c.kind, title: c.title, body: c.body, sourceUuid: c.sourceUuid, ...tag },
+                      ])
                     }}
                   />
                 </Box>
@@ -654,6 +833,17 @@ function labelledRule(label: string, width: number): string {
 // ────────────────────────────────────────────────────────────────────────────
 // Hooks
 // ────────────────────────────────────────────────────────────────────────────
+
+/** Keeps at most `cap` candidates for each agent (and for the main conversation), newest first. */
+function capPerAgent(list: PinboardCandidate[], cap: number): PinboardCandidate[] {
+  const seen = new Map<string, number>()
+  return list.filter(c => {
+    const key = c.agentId ?? ''
+    const n = (seen.get(key) ?? 0) + 1
+    seen.set(key, n)
+    return n <= cap
+  })
+}
 
 /** A plugin tool answers with a string (or an array of content blocks); an object is refused. */
 function toolText(text: string) {
@@ -720,10 +910,14 @@ export const register: Register = on => {
       $.ui.log(`pinboard: registration failed: ${String(err)}`, { to: 'debug' })
     }
 
-    // The store is the truth; session state mirrors it so the pane redraws on every change.
-    const stored = await $.store.get(STORE_PINS)
-    const list = Array.isArray(stored) ? (stored as PinboardPin[]) : []
-    await update($, pins, () => list)
+    // The store is the truth; session state mirrors it so the pane redraws on every change. The timer
+    // picks up what other sessions pin or remove while this one runs.
+    const list = await refreshPins($)
+    const savedFilter = await $.store.get(STORE_FILTER)
+    if (isFilter(savedFilter)) await update($, filter, () => savedFilter)
+    $.clock.every(REFRESH_MS, () => {
+      void refreshPins($).catch(() => undefined)
+    })
     if (e.isInteractive && list.length > 0) await openPane($, { asked: false })
 
     return next(e)
@@ -739,7 +933,9 @@ export const register: Register = on => {
     if (!markdown) return toolText('error: markdown is empty')
     const title = typeof input.title === 'string' ? cleanTitle(input.title) : ''
     const kind = isKind(input.kind) ? input.kind : classify(markdown)
-    const added = await addPins($, [{ kind, title, body: markdown }])
+    // A subagent or teammate calling the tool runs in its own loop: the pin remembers which.
+    const tag = await agentTag($, typeof input.agentId === 'string' ? input.agentId : undefined)
+    const added = await addPins($, [{ kind, title, body: markdown, ...tag }])
     await openPane($, { asked: true })
     const first = added[0]
     return toolText(first ? `pinned: ${describe(first)} (id ${first.id})` : 'already pinned (identical content exists)')
@@ -763,18 +959,24 @@ export const register: Register = on => {
   }).catch(() => ({ deny: 'pinboard: unpin failed' }))
 
   on('tool.call', { tool: 'mcp__pinboard__list' }, async $ => {
-    const list = await read($, pins)
+    const list = await refreshPins($)
     if (list.length === 0) return toolText('no pins')
     return toolText(
-      list.map((p, i) => `${i + 1}. [${p.kind}] ${p.title} · ${projectName(p.cwd)} · id ${p.id}`).join('\n'),
+      list
+        .map((p, i) => {
+          const agent = p.agentLabel ? ` · agent ${p.agentLabel}` : ''
+          return `${i + 1}. [${p.kind}] ${p.title} · ${projectName(p.cwd)}${agent} · id ${p.id}`
+        })
+        .join('\n'),
     )
   }).catch(() => ({ deny: 'pinboard: list failed' }))
 
-  // Every block of a reply on the main loop: its tables and artifact links become one-press candidates.
+  // Every block of a reply, the main conversation's and each agent's: its tables and artifact links become
+  // one-press candidates, tagged with the agent. The pane offers each view its own.
   on('session.append', { door: 'response' }, async ($, e, next) => {
     const stored = await next(e)
     try {
-      if (e.agentId === undefined && e.message.role === 'assistant') {
+      if (e.message.role === 'assistant') {
         const texts: string[] = []
         for (const block of e.message.content) {
           if (block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
@@ -782,9 +984,10 @@ export const register: Register = on => {
         const found = texts.flatMap(t => extractAll(t))
         if (found.length > 0) {
           const now = await $.clock.now()
-          const pinned = new Set((await read($, pins)).map(p => bodyKey(p.body)))
+          const pinned = new Set((await refreshPins($)).map(p => bodyKey(p.body)))
           const fresh = found.filter(f => !pinned.has(bodyKey(f.body)))
           if (fresh.length > 0) {
+            const tag = await agentTag($, e.agentId)
             await update($, candidates, list => {
               const have = new Set(list.map(c => bodyKey(c.body)))
               const incoming: PinboardCandidate[] = fresh
@@ -796,11 +999,13 @@ export const register: Register = on => {
                   body: f.body,
                   sourceUuid: e.uuid,
                   seenAt: now,
+                  ...tag,
                 }))
-              return [...incoming, ...list].slice(0, MAX_CANDIDATES)
+              return capPerAgent([...incoming, ...list], MAX_CANDIDATES)
             })
+            // Only the main conversation opens the pane unasked: agents can be many and busy.
             // Awaited: work a hook leaves running is dropped when its dispatch ends.
-            if (!(await isPaneOpen($))) await openPane($, { asked: false })
+            if (e.agentId === undefined && !(await isPaneOpen($))) await openPane($, { asked: false })
           }
         }
       }

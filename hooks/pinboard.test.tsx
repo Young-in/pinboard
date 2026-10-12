@@ -12,12 +12,36 @@ const PANE_PROPS = {
   view: {},
 } as const
 
-type StoredPin = { id: string; kind: string; title: string; body: string }
+type StoredPin = {
+  id: string
+  kind: string
+  title: string
+  body: string
+  sessionId: string
+  cwd: string
+  createdAt: number
+  agentId?: string
+  agentLabel?: string
+}
+
+/** A pin as another session of the same install would have written it to the shared store. */
+function foreignPin(id: string, title: string, extra: Partial<StoredPin> = {}): StoredPin {
+  return {
+    id,
+    kind: 'text',
+    title,
+    body: `body of ${id}`,
+    sessionId: 'session-B',
+    cwd: '/tmp/proj',
+    createdAt: 1,
+    ...extra,
+  }
+}
 
 /** The engine beneath the plugin: what a session answers, from memory. */
-function engine(on: On) {
+function engine(on: On, sessionId = 'session-1') {
   const store = new Map<string, unknown>()
-  mock.clock(on)
+  const clock = mock.clock(on)
   on('store.get', ($, e) => ({ value: store.get(e.key) }))
   on('store.set', ($, e) => {
     store.set(e.key, e.value)
@@ -29,7 +53,7 @@ function engine(on: On) {
   })
   on('store.keys', () => ({ value: [...store.keys()] }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: 'session-1' }))
+  on('session.id', () => ({ value: sessionId }))
   on('session.cwd', () => ({ value: '/tmp/proj' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__pinboard__${e.name}` } }))
@@ -40,8 +64,135 @@ function engine(on: On) {
   })
   on('ui.close', () => ({ value: undefined }))
   on('ui.panes', () => ({ value: [] }))
-  return { pins: () => (store.get('pins') as StoredPin[] | undefined) ?? [], opens }
+  on('agent.list', () => ({ value: [{ id: AGENT, description: '표 찾기', type: 'Explore', status: 'running' }] }))
+  on('session.messages', ($, e) => ({
+    value: [
+      { role: 'user', text: 'go', toolUses: [] },
+      { role: 'assistant', text: e.agentId === AGENT ? AGENT_REPLY : MAIN_REPLY, toolUses: [] },
+    ],
+  }))
+  return { pins: () => (store.get('pins') as StoredPin[] | undefined) ?? [], opens, store, clock }
 }
+
+const AGENT = 'agent-1'
+const AGENT_REPLY = '에이전트 결과:\n\n| step | ok |\n|---|---|\n| 1 | y |'
+const MAIN_REPLY = '메인 결과:\n\n| run | acc |\n|---|---|\n| 1 | 0.9 |'
+const AGENT_VIEW = { ...PANE_PROPS, view: { agentId: AGENT } }
+const RUN = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } } as const
+
+function reply(agentId: string | undefined, uuid: string, text: string) {
+  return {
+    message: { type: 'assistant' as const, role: 'assistant' as const, content: [{ type: 'text', text }] },
+    door: 'response' as const,
+    origin: { kind: 'model' as const, model: 'test-model' },
+    uuid,
+    ...(agentId ? { agentId } : {}),
+  }
+}
+
+test('an agent reply offers its candidates only in that agent view, and the pin keeps the agent', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.session.append(reply(AGENT, 'row-a', AGENT_REPLY))
+  expect(world.opens).toEqual([])
+
+  const main = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await main.find({ type: 'Button', text: /에이전트 결과/ })).toBeUndefined()
+  await main.unmount()
+
+  const agent = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: AGENT_VIEW,
+  })
+  expect(await agent.find({ type: 'Text', text: /↳ 표 찾기/ })).toBeDefined()
+  const cand = await agent.find({ type: 'Button', text: /에이전트 결과/ })
+  expect(cand).toBeDefined()
+  await agent.press({ key: cand!.key! })
+  expect(world.pins()[0]).toMatchObject({ title: '에이전트 결과', agentId: AGENT, agentLabel: '표 찾기' })
+  await agent.unmount()
+
+  const back = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await back.find({ type: 'Text', text: /@표 찾기/ })).toBeDefined()
+  await back.unmount()
+})
+
+test('an agent view lists only that agent pins, and /pin there saves the agent last answer', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'main note', title: '메인 핀' })
+  const mainPin = world.pins()[0]!
+
+  const agent = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: AGENT_VIEW,
+  })
+  expect(await agent.find({ key: `sel:${mainPin.id}` })).toBeUndefined()
+  expect(await agent.find({ type: 'Text', text: /이 에이전트의 핀이 아직 없어요/ })).toBeDefined()
+
+  const { text } = await $.command.run({ command: 'pin', args: '', ...RUN })
+  expect(text).toContain('에이전트 표 찾기')
+  const agentPin = world.pins().find(p => p.agentId === AGENT)!
+  expect(agentPin).toMatchObject({ kind: 'table', title: '에이전트 결과' })
+  expect(await agent.find({ key: `sel:${agentPin.id}` })).toBeDefined()
+  await agent.unmount()
+
+  const main = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await main.find({ key: `sel:${mainPin.id}` })).toBeDefined()
+  expect(await main.find({ key: `sel:${agentPin.id}` })).toBeDefined()
+  await main.unmount()
+
+  await $.command.run({ command: 'pin', args: '', ...RUN })
+  expect(world.pins().find(p => p.title === '메인 결과')?.agentId).toBeUndefined()
+})
+
+test('another session saving meanwhile is kept and shown, not overwritten', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  world.store.set('pins', [foreignPin('b-1', 'B가 저장한 핀')])
+
+  await world.clock.advance(3_000)
+  const ui = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await ui.find({ key: 'sel:b-1' })).toBeDefined()
+  await ui.unmount()
+
+  world.store.set('pins', [foreignPin('b-2', 'B의 두 번째 핀'), foreignPin('b-1', 'B가 저장한 핀')])
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'from A', title: 'A가 저장한 핀' })
+  expect(world.pins().map(p => p.title)).toEqual(['A가 저장한 핀', 'B의 두 번째 핀', 'B가 저장한 핀'])
+
+  world.store.set('pins', [foreignPin('b-3', 'B의 세 번째 핀'), ...world.pins()])
+  await $.tool.call({ tool: 'mcp__pinboard__unpin', title: 'A가 저장한 핀' })
+  expect(world.pins().map(p => p.title)).toEqual(['B의 세 번째 핀', 'B의 두 번째 핀', 'B가 저장한 핀'])
+})
 
 test('pin tool stores a pin; the pane lists it, deletes on a second press, and undoes', async ($, on) => {
   const world = engine(on)
@@ -138,6 +289,61 @@ test('rows fit long titles to the pane width and mark the selected one', async (
 
   await ui.press({ key: `sel:${id}` })
   expect(await ui.find({ type: 'Text', text: /▍/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('pins are grouped by session, this session first, and the session tab narrows to it', async ($, on) => {
+  const world = engine(on, 'session-A')
+  world.store.set('pins', [foreignPin('b-1', 'B가 저장한 핀', { createdAt: Date.UTC(2026, 9, 12, 5, 0) })])
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'from A', title: 'A가 저장한 핀' })
+  const mine = world.pins().find(p => p.title === 'A가 저장한 핀')!
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'pinboard',
+      surface,
+      component: 'Pane',
+      requestId: 'pins',
+      props: PANE_PROPS,
+    })
+    expect(await ui.find({ type: 'Text', text: /^이 세션$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^다른 세션 · \d\d-\d\d \d\d:\d\d · proj$/ })).toBeDefined()
+    expect((await ui.find({ key: `sel:${mine.id}` }))?.props).toMatchObject({ hotkey: '1' })
+    expect((await ui.find({ key: 'sel:b-1' }))?.props).toMatchObject({ hotkey: '2' })
+
+    await ui.press({ key: 'tab:session' })
+    expect(await ui.find({ key: `sel:${mine.id}` })).toBeDefined()
+    expect(await ui.find({ key: 'sel:b-1' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^이 세션$/ })).toBeUndefined()
+    expect(world.store.get('filter')).toBe('session')
+
+    await ui.press({ key: 'tab:all' })
+    await ui.unmount()
+  }
+
+  await $.command.run({
+    command: 'unpin',
+    args: '2',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+  expect(world.pins().map(p => p.id)).toEqual([mine.id])
+})
+
+test('the chosen tab is remembered for the next session', async ($, on) => {
+  const world = engine(on)
+  world.store.set('filter', 'session')
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  const ui = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await ui.find({ type: 'Button', key: 'tab:session' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'tab:all' })).toBeDefined()
   await ui.unmount()
 })
 
