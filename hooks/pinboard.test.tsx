@@ -64,8 +64,110 @@ function engine(on: On, sessionId = 'session-1') {
   })
   on('ui.close', () => ({ value: undefined }))
   on('ui.panes', () => ({ value: [] }))
+  on('agent.list', () => ({ value: [{ id: AGENT, description: '표 찾기', type: 'Explore', status: 'running' }] }))
+  on('session.messages', ($, e) => ({
+    value: [
+      { role: 'user', text: 'go', toolUses: [] },
+      { role: 'assistant', text: e.agentId === AGENT ? AGENT_REPLY : MAIN_REPLY, toolUses: [] },
+    ],
+  }))
   return { pins: () => (store.get('pins') as StoredPin[] | undefined) ?? [], opens, store, clock }
 }
+
+const AGENT = 'agent-1'
+const AGENT_REPLY = '에이전트 결과:\n\n| step | ok |\n|---|---|\n| 1 | y |'
+const MAIN_REPLY = '메인 결과:\n\n| run | acc |\n|---|---|\n| 1 | 0.9 |'
+const AGENT_VIEW = { ...PANE_PROPS, view: { agentId: AGENT } }
+const RUN = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } } as const
+
+function reply(agentId: string | undefined, uuid: string, text: string) {
+  return {
+    message: { type: 'assistant' as const, role: 'assistant' as const, content: [{ type: 'text', text }] },
+    door: 'response' as const,
+    origin: { kind: 'model' as const, model: 'test-model' },
+    uuid,
+    ...(agentId ? { agentId } : {}),
+  }
+}
+
+test('an agent reply offers its candidates only in that agent view, and the pin keeps the agent', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.session.append(reply(AGENT, 'row-a', AGENT_REPLY))
+  expect(world.opens).toEqual([])
+
+  const main = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await main.find({ type: 'Button', text: /에이전트 결과/ })).toBeUndefined()
+  await main.unmount()
+
+  const agent = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: AGENT_VIEW,
+  })
+  expect(await agent.find({ type: 'Text', text: /↳ 표 찾기/ })).toBeDefined()
+  const cand = await agent.find({ type: 'Button', text: /에이전트 결과/ })
+  expect(cand).toBeDefined()
+  await agent.press({ key: cand!.key! })
+  expect(world.pins()[0]).toMatchObject({ title: '에이전트 결과', agentId: AGENT, agentLabel: '표 찾기' })
+  await agent.unmount()
+
+  const back = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await back.find({ type: 'Text', text: /@표 찾기/ })).toBeDefined()
+  await back.unmount()
+})
+
+test('an agent view lists only that agent pins, and /pin there saves the agent last answer', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'main note', title: '메인 핀' })
+  const mainPin = world.pins()[0]!
+
+  const agent = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: AGENT_VIEW,
+  })
+  expect(await agent.find({ key: `sel:${mainPin.id}` })).toBeUndefined()
+  expect(await agent.find({ type: 'Text', text: /이 에이전트의 핀이 아직 없어요/ })).toBeDefined()
+
+  const { text } = await $.command.run({ command: 'pin', args: '', ...RUN })
+  expect(text).toContain('에이전트 표 찾기')
+  const agentPin = world.pins().find(p => p.agentId === AGENT)!
+  expect(agentPin).toMatchObject({ kind: 'table', title: '에이전트 결과' })
+  expect(await agent.find({ key: `sel:${agentPin.id}` })).toBeDefined()
+  await agent.unmount()
+
+  const main = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await main.find({ key: `sel:${mainPin.id}` })).toBeDefined()
+  expect(await main.find({ key: `sel:${agentPin.id}` })).toBeDefined()
+  await main.unmount()
+
+  await $.command.run({ command: 'pin', args: '', ...RUN })
+  expect(world.pins().find(p => p.title === '메인 결과')?.agentId).toBeUndefined()
+})
 
 test('another session saving meanwhile is kept and shown, not overwritten', async ($, on) => {
   const world = engine(on)

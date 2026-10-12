@@ -10,6 +10,10 @@ export type PinboardPin = {
   title: string
   body: string
   sourceUuid?: string
+  /** The subagent or teammate it came from; absent for the main conversation. */
+  agentId?: string
+  /** That agent's name as shown when it was pinned, kept since the agent is gone in later sessions. */
+  agentLabel?: string
 }
 
 /** A table or artifact link seen in a reply this session, one press away from being a pin. */
@@ -20,6 +24,9 @@ export type PinboardCandidate = {
   body: string
   sourceUuid: string
   seenAt: number
+  /** The subagent or teammate whose reply it was in; absent for the main conversation. */
+  agentId?: string
+  agentLabel?: string
 }
 
 export type PinboardFilter = 'all' | 'session' | 'project' | 'table' | 'artifact' | 'link'
