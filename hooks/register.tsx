@@ -38,6 +38,8 @@ const STORE_AUTO_OPEN = 'autoOpen'
 const MAX_PINS = 200
 const MAX_BODY = 20_000
 const MAX_CANDIDATES = 8
+/** How often a session re-reads the shared store to show what other sessions pinned or removed. */
+const REFRESH_MS = 3_000
 
 const FILTERS: PinboardFilter[] = ['all', 'table', 'artifact', 'link', 'project']
 const FILTER_LABEL: Record<PinboardFilter, string> = {
@@ -71,81 +73,112 @@ function describe(p: PinboardPin): string {
   return `${GLYPH[p.kind]} ${p.title}`
 }
 
-/** Writes the list to session state (redraws the pane) and to the store (survives the session). */
-async function persist($: Dollar, list: PinboardPin[]): Promise<void> {
-  await update($, pins, () => list)
-  await $.store.set(STORE_PINS, list)
+// Every session of one installed copy shares one list in `$.store`. The store is the truth: each change
+// reads it right before writing, and `refreshPins` mirrors it into session state, where the pane reads it.
+
+/** The pins as the store holds them now. */
+async function loadPins($: Dollar): Promise<PinboardPin[]> {
+  const stored = await $.store.get(STORE_PINS)
+  return Array.isArray(stored) ? (stored as PinboardPin[]) : []
+}
+
+function signature(list: readonly PinboardPin[]): string {
+  return list.map(p => p.id).join(',')
+}
+
+/** Mirrors the store into session state when another session changed it, so the pane redraws. */
+async function refreshPins($: Dollar): Promise<PinboardPin[]> {
+  const fresh = await loadPins($)
+  const mirrored = await read($, pins)
+  if (signature(fresh) !== signature(mirrored)) await update($, pins, () => fresh)
+  return fresh
+}
+
+/**
+ * Changes the shared list: reads the store fresh, applies `change`, writes the result back and mirrors it.
+ * Reading right before writing keeps what other sessions saved meanwhile. `change` returning its input
+ * unchanged writes nothing.
+ */
+async function mutatePins($: Dollar, change: (list: PinboardPin[]) => PinboardPin[]): Promise<PinboardPin[]> {
+  const list = await loadPins($)
+  const next = change(list)
+  if (next !== list) await $.store.set(STORE_PINS, next.slice(0, MAX_PINS))
+  await update($, pins, () => next.slice(0, MAX_PINS))
+  return next
 }
 
 /** Adds the items not already pinned (same body, whitespace aside), newest first; returns what was added. */
 async function addPins($: Dollar, items: PinInput[]): Promise<PinboardPin[]> {
-  const [now, sessionId, cwd, current] = await Promise.all([
-    $.clock.now(),
-    $.session.id(),
-    $.session.cwd(),
-    read($, pins),
-  ])
-  const known = new Set(current.map(p => bodyKey(p.body)))
+  const [now, sessionId, cwd] = await Promise.all([$.clock.now(), $.session.id(), $.session.cwd()])
   const added: PinboardPin[] = []
-  for (const it of items) {
-    const body = it.body.length > MAX_BODY ? `${it.body.slice(0, MAX_BODY)}\n\n…(잘림)` : it.body
-    const key = bodyKey(body)
-    if (!key || known.has(key)) continue
-    known.add(key)
-    const pin: PinboardPin = {
-      id: newId(now + added.length),
-      createdAt: now,
-      sessionId,
-      cwd,
-      kind: it.kind,
-      title: it.title || firstLineTitle(body),
-      body,
+  await mutatePins($, current => {
+    const known = new Set(current.map(p => bodyKey(p.body)))
+    for (const it of items) {
+      const body = it.body.length > MAX_BODY ? `${it.body.slice(0, MAX_BODY)}\n\n…(잘림)` : it.body
+      const key = bodyKey(body)
+      if (!key || known.has(key)) continue
+      known.add(key)
+      const pin: PinboardPin = {
+        id: newId(now + added.length),
+        createdAt: now,
+        sessionId,
+        cwd,
+        kind: it.kind,
+        title: it.title || firstLineTitle(body),
+        body,
+      }
+      if (it.sourceUuid) pin.sourceUuid = it.sourceUuid
+      added.push(pin)
     }
-    if (it.sourceUuid) pin.sourceUuid = it.sourceUuid
-    added.push(pin)
-  }
+    return added.length > 0 ? [...added, ...current] : current
+  })
   if (added.length === 0) return []
-  await persist($, [...added, ...current].slice(0, MAX_PINS))
+  const addedKeys = new Set(added.map(p => bodyKey(p.body)))
   await update($, selectedId, () => added[0]?.id ?? null)
   await update($, confirmDeleteId, () => null)
-  await update($, candidates, list => list.filter(c => !known.has(bodyKey(c.body))))
+  await update($, candidates, list => list.filter(c => !addedKeys.has(bodyKey(c.body))))
   return added
 }
 
 /** Removes one pin and keeps it as `lastRemoved` for undo. */
 async function removePin($: Dollar, id: string): Promise<PinboardPin | undefined> {
-  const current = await read($, pins)
-  const target = current.find(p => p.id === id)
+  let target: PinboardPin | undefined
+  await mutatePins($, current => {
+    target = current.find(p => p.id === id)
+    return target ? current.filter(p => p.id !== id) : current
+  })
   if (!target) return undefined
-  await persist(
-    $,
-    current.filter(p => p.id !== id),
-  )
-  await update($, lastRemoved, () => target)
+  const removed = target
+  await update($, lastRemoved, () => removed)
   await update($, confirmDeleteId, () => null)
   await update($, selectedId, cur => (cur === id ? null : cur))
-  return target
+  return removed
 }
 
 /** Restores the last removed pin, or the backup `/pin clear` left. */
 async function undo($: Dollar): Promise<string> {
   const removed = await read($, lastRemoved)
   if (removed) {
-    const current = await read($, pins)
-    if (!current.some(p => p.id === removed.id)) await persist($, [removed, ...current].slice(0, MAX_PINS))
+    await mutatePins($, current =>
+      current.some(p => p.id === removed.id)
+        ? current
+        : [removed, ...current].sort((a, b) => b.createdAt - a.createdAt),
+    )
     await update($, lastRemoved, () => null)
     await update($, selectedId, () => removed.id)
     return `↩ 되돌림: ${describe(removed)}`
   }
   const backup = await $.store.get(STORE_BACKUP)
   if (Array.isArray(backup) && backup.length > 0) {
-    const current = await read($, pins)
-    const ids = new Set(current.map(p => p.id))
-    const restored = (backup as PinboardPin[]).filter(p => !ids.has(p.id))
-    const merged = [...current, ...restored].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_PINS)
-    await persist($, merged)
+    let restored = 0
+    await mutatePins($, current => {
+      const ids = new Set(current.map(p => p.id))
+      const back = (backup as PinboardPin[]).filter(p => !ids.has(p.id))
+      restored = back.length
+      return [...current, ...back].sort((a, b) => b.createdAt - a.createdAt)
+    })
     await $.store.delete(STORE_BACKUP)
-    return `↩ 되돌림: 핀 ${restored.length}개 복구`
+    return `↩ 되돌림: 핀 ${restored}개 복구`
   }
   return '되돌릴 핀이 없습니다.'
 }
@@ -173,7 +206,7 @@ async function openPane($: Dollar, options: { asked: boolean; focus?: boolean })
 
 /** A pin by its number in the pane (filtered, newest first), `last`, its id, or a title substring. */
 async function resolvePin($: Dollar, token: string): Promise<PinboardPin | undefined> {
-  const list = await read($, pins)
+  const list = await refreshPins($)
   const t = token.trim()
   if (!t || t === 'last') return list[0]
   const n = Number(t)
@@ -276,7 +309,7 @@ async function runShow($: Dollar, token: string): Promise<string> {
 }
 
 async function runClear($: Dollar, rest: string): Promise<string> {
-  const list = await read($, pins)
+  const list = await refreshPins($)
   if (list.length === 0) return '저장된 핀이 없습니다.'
   let ok = rest.trim() === '--yes'
   if (!ok) {
@@ -287,15 +320,19 @@ async function runClear($: Dollar, rest: string): Promise<string> {
     }
   }
   if (!ok) return '취소됨'
-  await $.store.set(STORE_BACKUP, list)
-  await persist($, [])
+  let cleared: PinboardPin[] = []
+  await mutatePins($, current => {
+    cleared = current
+    return []
+  })
+  await $.store.set(STORE_BACKUP, cleared)
   await update($, selectedId, () => null)
   await update($, lastRemoved, () => null)
-  return `🗑 핀 ${list.length}개 삭제 (/pin undo 로 복구)`
+  return `🗑 핀 ${cleared.length}개 삭제 (/pin undo 로 복구)`
 }
 
 async function runExport($: Dollar): Promise<string> {
-  const list = await read($, pins)
+  const list = await refreshPins($)
   if (list.length === 0) return '내보낼 핀이 없습니다.'
   const home = (await $.env.get('HOME')) ?? '.'
   const date = localStamp(await $.clock.now()).slice(0, 10)
@@ -720,10 +757,12 @@ export const register: Register = on => {
       $.ui.log(`pinboard: registration failed: ${String(err)}`, { to: 'debug' })
     }
 
-    // The store is the truth; session state mirrors it so the pane redraws on every change.
-    const stored = await $.store.get(STORE_PINS)
-    const list = Array.isArray(stored) ? (stored as PinboardPin[]) : []
-    await update($, pins, () => list)
+    // The store is the truth; session state mirrors it so the pane redraws on every change. The timer
+    // picks up what other sessions pin or remove while this one runs.
+    const list = await refreshPins($)
+    $.clock.every(REFRESH_MS, () => {
+      void refreshPins($).catch(() => undefined)
+    })
     if (e.isInteractive && list.length > 0) await openPane($, { asked: false })
 
     return next(e)
@@ -763,7 +802,7 @@ export const register: Register = on => {
   }).catch(() => ({ deny: 'pinboard: unpin failed' }))
 
   on('tool.call', { tool: 'mcp__pinboard__list' }, async $ => {
-    const list = await read($, pins)
+    const list = await refreshPins($)
     if (list.length === 0) return toolText('no pins')
     return toolText(
       list.map((p, i) => `${i + 1}. [${p.kind}] ${p.title} · ${projectName(p.cwd)} · id ${p.id}`).join('\n'),
@@ -782,7 +821,7 @@ export const register: Register = on => {
         const found = texts.flatMap(t => extractAll(t))
         if (found.length > 0) {
           const now = await $.clock.now()
-          const pinned = new Set((await read($, pins)).map(p => bodyKey(p.body)))
+          const pinned = new Set((await refreshPins($)).map(p => bodyKey(p.body)))
           const fresh = found.filter(f => !pinned.has(bodyKey(f.body)))
           if (fresh.length > 0) {
             await update($, candidates, list => {

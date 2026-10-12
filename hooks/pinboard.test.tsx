@@ -12,12 +12,36 @@ const PANE_PROPS = {
   view: {},
 } as const
 
-type StoredPin = { id: string; kind: string; title: string; body: string }
+type StoredPin = {
+  id: string
+  kind: string
+  title: string
+  body: string
+  sessionId: string
+  cwd: string
+  createdAt: number
+  agentId?: string
+  agentLabel?: string
+}
+
+/** A pin as another session of the same install would have written it to the shared store. */
+function foreignPin(id: string, title: string, extra: Partial<StoredPin> = {}): StoredPin {
+  return {
+    id,
+    kind: 'text',
+    title,
+    body: `body of ${id}`,
+    sessionId: 'session-B',
+    cwd: '/tmp/proj',
+    createdAt: 1,
+    ...extra,
+  }
+}
 
 /** The engine beneath the plugin: what a session answers, from memory. */
-function engine(on: On) {
+function engine(on: On, sessionId = 'session-1') {
   const store = new Map<string, unknown>()
-  mock.clock(on)
+  const clock = mock.clock(on)
   on('store.get', ($, e) => ({ value: store.get(e.key) }))
   on('store.set', ($, e) => {
     store.set(e.key, e.value)
@@ -29,7 +53,7 @@ function engine(on: On) {
   })
   on('store.keys', () => ({ value: [...store.keys()] }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: 'session-1' }))
+  on('session.id', () => ({ value: sessionId }))
   on('session.cwd', () => ({ value: '/tmp/proj' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__pinboard__${e.name}` } }))
@@ -40,8 +64,33 @@ function engine(on: On) {
   })
   on('ui.close', () => ({ value: undefined }))
   on('ui.panes', () => ({ value: [] }))
-  return { pins: () => (store.get('pins') as StoredPin[] | undefined) ?? [], opens }
+  return { pins: () => (store.get('pins') as StoredPin[] | undefined) ?? [], opens, store, clock }
 }
+
+test('another session saving meanwhile is kept and shown, not overwritten', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  world.store.set('pins', [foreignPin('b-1', 'B가 저장한 핀')])
+
+  await world.clock.advance(3_000)
+  const ui = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: PANE_PROPS,
+  })
+  expect(await ui.find({ key: 'sel:b-1' })).toBeDefined()
+  await ui.unmount()
+
+  world.store.set('pins', [foreignPin('b-2', 'B의 두 번째 핀'), foreignPin('b-1', 'B가 저장한 핀')])
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'from A', title: 'A가 저장한 핀' })
+  expect(world.pins().map(p => p.title)).toEqual(['A가 저장한 핀', 'B의 두 번째 핀', 'B가 저장한 핀'])
+
+  world.store.set('pins', [foreignPin('b-3', 'B의 세 번째 핀'), ...world.pins()])
+  await $.tool.call({ tool: 'mcp__pinboard__unpin', title: 'A가 저장한 핀' })
+  expect(world.pins().map(p => p.title)).toEqual(['B의 세 번째 핀', 'B의 두 번째 핀', 'B가 저장한 핀'])
+})
 
 test('pin tool stores a pin; the pane lists it, deletes on a second press, and undoes', async ($, on) => {
   const world = engine(on)
