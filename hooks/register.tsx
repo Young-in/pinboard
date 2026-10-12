@@ -20,8 +20,8 @@ import {
   firstLineTitle,
   isKind,
   projectName,
-  relativeTime,
 } from './extract'
+import { fitWidth, KIND_LABEL, localStamp, shortAge, textWidth } from './format'
 
 // ────────────────────────────────────────────────────────────────────────────
 // State, store and shared operations
@@ -298,11 +298,11 @@ async function runExport($: Dollar): Promise<string> {
   const list = await read($, pins)
   if (list.length === 0) return '내보낼 핀이 없습니다.'
   const home = (await $.env.get('HOME')) ?? '.'
-  const date = new Date(await $.clock.now()).toISOString().slice(0, 10)
+  const date = localStamp(await $.clock.now()).slice(0, 10)
   const path = `${home}/.claude/pins/pins-${date}.md`
   const sections = list.map(p => {
-    const when = new Date(p.createdAt).toISOString().slice(0, 16).replace('T', ' ')
-    return `## ${GLYPH[p.kind]} ${p.title}\n\n_${p.kind} · ${projectName(p.cwd)} · ${when}_\n\n${p.body}\n`
+    const meta = `${KIND_LABEL[p.kind]} · ${projectName(p.cwd)} · ${localStamp(p.createdAt)}`
+    return `## ${GLYPH[p.kind]} ${p.title}\n\n_${meta}_\n\n${p.body}\n`
   })
   try {
     await $.fs.write(path, [`# Pins (${list.length}) · ${date}`, '', ...sections].join('\n'))
@@ -378,6 +378,14 @@ async function togglePane($: Dollar): Promise<string> {
 
 const MAX_ROWS = 30
 const CANDIDATE_HOTKEYS = ['a', 's', 'd', 'g', 'h']
+// Theme keys, so the colors follow the person's light or dark theme.
+const ACCENT = 'claude'
+const KIND_COLOR: Record<PinboardKind, string> = {
+  table: 'suggestion',
+  artifact: 'merged',
+  link: 'ide',
+  text: 'subtle',
+}
 
 async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const { Box, Text, Button, Markdown, Link } = $.ui.resolve(e)
@@ -394,166 +402,253 @@ async function renderPane($: Dollar, e: RenderInputOf<'Pane', RenderSurface>) {
   const shown = visible(list, f, cwd)
   const selected = shown.find(p => p.id === sel) ?? null
   const width = Math.max(20, e.props.bodyColumns)
-  const labelWidth = Math.max(10, width - 12)
 
   const select = (id: string) => {
     void update($, confirmDeleteId, () => null)
     void update($, selectedId, cur => (cur === id ? null : id))
   }
-  const cycleFilter = () => {
+  const setFilter = (next: PinboardFilter) => {
     void update($, selectedId, () => null)
-    void update($, filter, cur => FILTERS[(FILTERS.indexOf(cur ?? 'all') + 1) % FILTERS.length] ?? 'all')
+    void update($, filter, () => next)
   }
+  const cycleFilter = () => setFilter(FILTERS[(FILTERS.indexOf(f) + 1) % FILTERS.length] ?? 'all')
+  const counts: Record<PinboardFilter, number> = {
+    all: list.length,
+    table: list.filter(p => p.kind === 'table').length,
+    artifact: list.filter(p => p.kind === 'artifact').length,
+    link: list.filter(p => p.kind === 'link').length,
+    project: list.filter(p => p.cwd === cwd).length,
+  }
+  const rule = '─'.repeat(width)
 
   return (
     <Box flexDirection="column">
       <Box justifyContent="space-between">
         <Text bold>
-          Pins {shown.length}
-          {f === 'all' ? '' : `/${list.length}`}
+          Pins <Text dimColor>{list.length}</Text>
         </Text>
-        <Button key="filter" hotkey="f" plain dimColor label={`필터: ${FILTER_LABEL[f]}`} onPress={cycleFilter} />
+        <Button key="filter" hotkey="f" plain dimColor label="다음 필터" onPress={cycleFilter} />
       </Box>
+      <Box flexWrap="wrap" columnGap={2}>
+        {FILTERS.map(name =>
+          name === f ? (
+            <Text color="claude" bold underline>
+              {FILTER_LABEL[name]} {counts[name]}
+            </Text>
+          ) : (
+            <Button
+              key={`tab:${name}`}
+              plain
+              dimColor
+              label={`${FILTER_LABEL[name]} ${counts[name]}`}
+              onPress={() => setFilter(name)}
+            />
+          ),
+        )}
+      </Box>
+      <Text dimColor>{rule}</Text>
 
-      {shown.length === 0 && (
-        <Text dimColor wrap="wrap">
-          {list.length === 0
-            ? '저장된 핀이 없습니다. /pin 으로 마지막 답변의 표·링크를 저장하거나, 아래 후보에서 고르세요.'
-            : '이 필터에 맞는 핀이 없습니다. f 로 필터를 바꾸세요.'}
-        </Text>
+      {list.length === 0 && (
+        <Box flexDirection="column" paddingX={2} marginY={1}>
+          <Text bold>아직 핀이 없어요</Text>
+          {EMPTY_HINTS.map(([how, what]) => (
+            <Text>
+              <Text color={ACCENT}>{padCells(how, 16)}</Text>
+              <Text dimColor>{what}</Text>
+            </Text>
+          ))}
+        </Box>
+      )}
+      {list.length > 0 && shown.length === 0 && (
+        <Box paddingX={2} marginY={1}>
+          <Text dimColor>이 필터에 맞는 핀이 없어요 · f 로 다음 필터</Text>
+        </Box>
       )}
 
       {shown.slice(0, MAX_ROWS).map((p, i) => {
-        const prefix = i < 9 ? '' : `${i + 1}. `
-        const label = `${prefix}${GLYPH[p.kind]} ${p.title}`.slice(0, labelWidth)
+        const isSelected = p.id === sel
+        const hotkey = i < 9 ? String(i + 1) : undefined
+        const age = shortAge(now, p.createdAt)
+        // marker 2 + "1: " 3 + gap 2 + glyph and age on the right
+        const room = width - 2 - 3 - 2 - (2 + textWidth(age))
+        const title = fitWidth(hotkey ? p.title : `${i + 1}. ${p.title}`, room)
         return (
-          <Box key={`row:${p.id}`} gap={1}>
-            <Button
-              key={`sel:${p.id}`}
-              {...(i < 9 ? { hotkey: String(i + 1) } : {})}
-              plain
-              dimColor={p.id !== sel}
-              label={label}
-              onPress={() => select(p.id)}
-            />
-            <Text dimColor>{relativeTime(now, p.createdAt)}</Text>
+          <Box key={`row:${p.id}`} justifyContent="space-between">
+            <Box>
+              <Text color={ACCENT}>{isSelected ? '▍ ' : '  '}</Text>
+              <Button
+                key={`sel:${p.id}`}
+                {...(hotkey ? { hotkey } : {})}
+                plain
+                dimColor={!isSelected}
+                hover={{ dimColor: false }}
+                label={title}
+                onPress={() => select(p.id)}
+              />
+            </Box>
+            <Text>
+              <Text color={KIND_COLOR[p.kind]}>{GLYPH[p.kind]}</Text> <Text dimColor>{age}</Text>
+            </Text>
           </Box>
         )
       })}
-      {shown.length > MAX_ROWS && <Text dimColor>… {shown.length - MAX_ROWS}개 더 (f 로 필터)</Text>}
+      {shown.length > MAX_ROWS && (
+        <Text dimColor>
+          {'  '}… {shown.length - MAX_ROWS}개 더 · f 로 필터
+        </Text>
+      )}
 
       {selected && (
-        <Box flexDirection="column" marginTop={1} paddingX={1} borderStyle="round" borderDimColor>
-          <Text bold wrap="truncate-end">
-            {GLYPH[selected.kind]} {selected.title}
+        <Box
+          flexDirection="column"
+          marginTop={1}
+          paddingX={1}
+          borderStyle="round"
+          borderColor={KIND_COLOR[selected.kind]}
+        >
+          <Text bold>
+            <Text color={KIND_COLOR[selected.kind]}>{GLYPH[selected.kind]}</Text> {fitWidth(selected.title, width - 6)}
           </Text>
           <Text dimColor wrap="truncate-end">
-            {selected.kind} · {projectName(selected.cwd)} ·{' '}
-            {new Date(selected.createdAt).toISOString().slice(0, 16).replace('T', ' ')}
+            {KIND_LABEL[selected.kind]} · {projectName(selected.cwd)} · {localStamp(selected.createdAt)}
           </Text>
-          {selected.kind === 'link' || selected.kind === 'artifact' ? (
-            <Link href={selected.body} />
-          ) : (
-            <Markdown text={selected.body} />
-          )}
-          <Box gap={1} marginTop={1} flexWrap="wrap">
-            <Button
-              key="copy"
-              hotkey="c"
-              label="복사"
-              onPress={press => {
-                void $.ui
-                  .copy({ text: selected.body, surface: press.surface })
-                  .then(r => $.ui.toast(r.isCopied ? '복사됨' : `복사 실패: ${r.reason}`))
-              }}
-            />
-            <Button
-              key="prompt"
-              hotkey="p"
-              label="프롬프트에 넣기"
-              onPress={() => {
-                void $.prompt.fill({ text: `${selected.body}\n`, mode: 'insert' })
-              }}
-            />
-            {confirm === selected.id ? (
-              <Box gap={1}>
-                <Button
-                  key="delete-yes"
-                  hotkey="x"
-                  variant="primary"
-                  label="정말 삭제"
-                  onPress={() => {
-                    void removePin($, selected.id)
-                  }}
-                />
-                <Button
-                  key="delete-no"
-                  hotkey="o"
-                  label="취소"
-                  onPress={() => void update($, confirmDeleteId, () => null)}
-                />
-              </Box>
+          <Box marginY={1} flexDirection="column">
+            {selected.kind === 'link' || selected.kind === 'artifact' ? (
+              <Link href={selected.body} label={fitWidth(selected.body, width - 4)} />
             ) : (
+              <Markdown text={selected.body} />
+            )}
+          </Box>
+          {confirm === selected.id ? (
+            <Box columnGap={2} flexWrap="wrap">
+              <Text color="error" bold>
+                정말 삭제할까요?
+              </Text>
+              <Button
+                key="delete-yes"
+                hotkey="x"
+                plain
+                label="삭제"
+                onPress={() => {
+                  void removePin($, selected.id)
+                }}
+              />
+              <Button
+                key="delete-no"
+                hotkey="o"
+                plain
+                label="취소"
+                onPress={() => void update($, confirmDeleteId, () => null)}
+              />
+            </Box>
+          ) : (
+            <Box columnGap={2} flexWrap="wrap">
+              <Button
+                key="copy"
+                hotkey="c"
+                plain
+                label="복사"
+                onPress={press => {
+                  void $.ui
+                    .copy({ text: selected.body, surface: press.surface })
+                    .then(r => $.ui.toast(r.isCopied ? '복사됨' : `복사 실패: ${r.reason}`))
+                }}
+              />
+              <Button
+                key="prompt"
+                hotkey="p"
+                plain
+                label="프롬프트에 넣기"
+                onPress={() => {
+                  void $.prompt.fill({ text: `${selected.body}\n`, mode: 'insert' })
+                }}
+              />
               <Button
                 key="delete"
                 hotkey="x"
+                plain
+                dimColor
                 label="삭제"
                 onPress={() => void update($, confirmDeleteId, () => selected.id)}
               />
-            )}
-          </Box>
+            </Box>
+          )}
         </Box>
       )}
 
       {removed && (
         <Box marginTop={1}>
+          <Text color="warning">↩ </Text>
           <Button
             key="undo"
             hotkey="u"
             plain
-            dimColor
-            label={`되돌리기: ${describe(removed)}`.slice(0, labelWidth)}
+            label="되돌리기"
             onPress={() => {
               void undo($)
             }}
           />
+          <Text dimColor> {fitWidth(removed.title, width - 16)}</Text>
         </Box>
       )}
 
       {cands.length > 0 && (
         <Box flexDirection="column" marginTop={1}>
-          <Text bold dimColor>
-            최근 후보 (이번 세션, 누르면 저장)
-          </Text>
+          <Text dimColor>{labelledRule('이번 세션의 후보 · 누르면 저장', width)}</Text>
           {cands.map((c, i) => {
             const hotkey = CANDIDATE_HOTKEYS[i]
+            const age = shortAge(now, c.seenAt)
+            const room = width - 2 - 3 - 2 - (2 + textWidth(age))
             return (
-              <Box key={`cand:${c.id}`} gap={1}>
-                <Button
-                  key={`save:${c.id}`}
-                  {...(hotkey ? { hotkey } : {})}
-                  plain
-                  label={`+ ${GLYPH[c.kind]} ${c.title}`.slice(0, labelWidth)}
-                  onPress={() => {
-                    void addPins($, [{ kind: c.kind, title: c.title, body: c.body, sourceUuid: c.sourceUuid }])
-                  }}
-                />
-                <Text dimColor>{relativeTime(now, c.seenAt)}</Text>
+              <Box key={`cand:${c.id}`} justifyContent="space-between">
+                <Box>
+                  <Text color={ACCENT}>+ </Text>
+                  <Button
+                    key={`save:${c.id}`}
+                    {...(hotkey ? { hotkey } : {})}
+                    plain
+                    dimColor
+                    hover={{ dimColor: false }}
+                    label={fitWidth(c.title, room)}
+                    onPress={() => {
+                      void addPins($, [{ kind: c.kind, title: c.title, body: c.body, sourceUuid: c.sourceUuid }])
+                    }}
+                  />
+                </Box>
+                <Text>
+                  <Text color={KIND_COLOR[c.kind]}>{GLYPH[c.kind]}</Text> <Text dimColor>{age}</Text>
+                </Text>
               </Box>
             )
           })}
         </Box>
       )}
 
-      <Box marginTop={1}>
-        <Text dimColor wrap="wrap">
-          {e.props.isFocused
-            ? '1-9 선택 · a/s/d/g/h 후보 저장 · c 복사 · p 프롬프트 · x 삭제 · u 되돌리기 · f 필터 · Esc 프롬프트로'
-            : 'ctrl+x tab: 패널 포커스 · /pin help: 도움말'}
+      <Box flexDirection="column" marginTop={1}>
+        <Text dimColor>{rule}</Text>
+        <Text dimColor wrap="truncate-end">
+          {e.props.isFocused ? 'Esc 프롬프트로 · /pin help 도움말' : 'ctrl+x tab 으로 패널 조작 · /pin help 도움말'}
         </Text>
       </Box>
     </Box>
   )
+}
+
+const EMPTY_HINTS: [string, string][] = [
+  ['/pin', '마지막 답변의 표·링크 저장'],
+  ['"이 표 핀해줘"', '모델에게 말로 저장'],
+  ['a s d g h', '아래 후보에서 바로 저장'],
+]
+
+/** `text` followed by spaces up to `cells` cells (at least one). */
+function padCells(text: string, cells: number): string {
+  return text + ' '.repeat(Math.max(1, cells - textWidth(text)))
+}
+
+/** A rule with a label at its start: `─ label ─────`, `width` cells long. */
+function labelledRule(label: string, width: number): string {
+  const head = `─ ${label} `
+  return head + '─'.repeat(Math.max(0, width - textWidth(head)))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

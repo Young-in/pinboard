@@ -1,6 +1,8 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { textWidth } from './format'
+
 const PANE_PROPS = {
   title: 'Pins',
   isFocused: true,
@@ -65,8 +67,13 @@ test('pin tool stores a pin; the pane lists it, deletes on a second press, and u
     expect(await ui.find({ type: 'Button', key: `sel:${id}` })).toBeDefined()
     expect(await ui.find({ type: 'Markdown' })).toBeDefined()
 
+    expect(await ui.find({ type: 'Text', text: /^표 · proj · \d{4}-\d\d-\d\d \d\d:\d\d$/ })).toBeDefined()
+    expect(await ui.find({ key: 'copy' })).toBeDefined()
+
     await ui.press({ key: 'delete' })
     expect(await ui.find({ key: 'delete-yes' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /정말 삭제할까요/ })).toBeDefined()
+    expect(await ui.find({ key: 'copy' })).toBeUndefined()
     expect(world.pins()).toHaveLength(1)
 
     await ui.press({ key: 'delete-yes' })
@@ -77,6 +84,61 @@ test('pin tool stores a pin; the pane lists it, deletes on a second press, and u
     expect(world.pins()).toHaveLength(1)
     await ui.unmount()
   }
+})
+
+test('filter tabs show counts and narrow the list', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: '| a |\n|---|\n| 1 |', title: '표 하나' })
+  await $.tool.call({ tool: 'mcp__pinboard__pin', markdown: 'https://example.com/docs', title: '문서 링크' })
+  const [link, table] = world.pins()
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'pinboard',
+      surface,
+      component: 'Pane',
+      requestId: 'pins',
+      props: PANE_PROPS,
+    })
+    expect(await ui.find({ type: 'Text', text: /전체 2/ })).toBeDefined()
+    expect((await ui.find({ type: 'Button', key: 'tab:link' }))?.text).toContain('링크 1')
+
+    await ui.press({ key: 'tab:link' })
+    expect(await ui.find({ key: `sel:${link!.id}` })).toBeDefined()
+    expect(await ui.find({ key: `sel:${table!.id}` })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', key: 'tab:all' })).toBeDefined()
+
+    await ui.press({ key: 'tab:all' })
+    expect(await ui.find({ key: `sel:${table!.id}` })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('rows fit long titles to the pane width and mark the selected one', async ($, on) => {
+  const world = engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  await $.tool.call({
+    tool: 'mcp__pinboard__pin',
+    markdown: '| a |\n|---|\n| 1 |',
+    title: '아주 긴 제목이 패널 폭을 넘어가는 경우를 확인하기 위한 핀',
+  })
+  const id = world.pins()[0]!.id
+  const ui = await $.ui.mount({
+    plugin: 'pinboard',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pins',
+    props: { ...PANE_PROPS, bodyColumns: 30 },
+  })
+  const row = await ui.find({ key: `sel:${id}` })
+  expect(row?.text).toContain('…')
+  expect(textWidth(row?.text ?? '')).toBeLessThanOrEqual(30)
+  expect(await ui.find({ type: 'Text', text: /▍/ })).toBeDefined()
+
+  await ui.press({ key: `sel:${id}` })
+  expect(await ui.find({ type: 'Text', text: /▍/ })).toBeUndefined()
+  await ui.unmount()
 })
 
 test('unpin and list tools work by title and index', async ($, on) => {
@@ -122,8 +184,26 @@ test('a reply with a table becomes a candidate the pane saves on one press', asy
   await ui.press({ key: table!.key! })
   expect(world.pins()).toHaveLength(1)
   expect(world.pins()[0]).toMatchObject({ kind: 'table', title: '실험 결과' })
-  expect(await ui.find({ type: 'Button', text: /\+ ▤ 실험 결과/ })).toBeUndefined()
+  expect(await ui.find({ key: table!.key! })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /이번 세션의 후보/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('an empty board explains how to pin', async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/tmp/proj', surface: 'terminal', isInteractive: false })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'pinboard',
+      surface,
+      component: 'Pane',
+      requestId: 'pins',
+      props: PANE_PROPS,
+    })
+    expect(await ui.find({ type: 'Text', text: /아직 핀이 없어요/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^\/pin +$/ })).toBeDefined()
+    await ui.unmount()
+  }
 })
 
 test('a new candidate opens the pane unasked once; /pins opens it asked', async ($, on) => {

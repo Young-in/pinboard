@@ -1,6 +1,6 @@
 {
   "name": "pinboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pin tables, artifact links and answers from the conversation into a side pane you can reopen any time (/pin, /pins, /unpin).",
   "types": "./types/index.d.ts",
   "author": {
